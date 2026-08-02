@@ -1,0 +1,9 @@
+models:
+  - claude-sonnet-4.5
+  - gpt-5.4
+conversations:
+  - messages:
+      - role: system
+        content: ${system}
+      - role: user
+        content: Run 'sleep 2 && echo done'

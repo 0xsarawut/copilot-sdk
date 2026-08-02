@@ -2,8 +2,7 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------------------------------------------*/
 
-import type { retrieveAvailableModels } from "@github/copilot/sdk";
-import { existsSync } from "fs";
+import { appendFileSync, existsSync } from "fs";
 import { mkdir, readFile, writeFile } from "fs/promises";
 import type {
   ChatCompletion,
@@ -20,13 +19,84 @@ import {
   CapturingHttpProxy,
   PerformRequestOptions,
 } from "./capturingHttpProxy";
+export type { CapturedRequest } from "./capturingHttpProxy";
+import {
+  anthropicMessagesEndpoint,
+  anthropicMessagesRequestToChatCompletion,
+  chatCompletionResponseToAnthropicMessage,
+  chatCompletionResponseToAnthropicSseChunks,
+} from "./anthropicMessagesAdapter";
+import {
+  chatCompletionResponseToResponsesApiMessage,
+  chatCompletionResponseToResponsesApiSseChunks,
+  responsesApiRequestToChatCompletion,
+  responsesEndpoint,
+} from "./responsesApiAdapter";
 import { iife, ShellConfig, sleep } from "./util";
 
 export const workingDirPlaceholder = "${workdir}";
 const chatCompletionEndpoint = "/chat/completions";
+export type ReplayBackend =
+  | "capi"
+  | "anthropic-messages"
+  | "openai-responses"
+  | "openai-completions";
+
+type ReplayProtocol = {
+  endpoint: string;
+  normalizeRequest?: (body: string) => string;
+  responseBody?: (response: ChatCompletion) => unknown;
+  responseChunks: (response: ChatCompletion) => string[];
+  responseEndChunk?: string;
+  errorBody?: (code: string | undefined, message: string) => unknown;
+  canonicalResponse?: boolean;
+};
+
+const chatCompletionsProtocol = {
+  endpoint: chatCompletionEndpoint,
+  responseChunks: (response) =>
+    convertToStreamingResponseChunks(response).map(
+      (chunk) => `data: ${JSON.stringify(chunk)}\n\n`,
+    ),
+  responseEndChunk: "data: [DONE]\n\n",
+  canonicalResponse: true,
+} satisfies ReplayProtocol;
+
+const replayProtocols: Record<ReplayBackend, ReplayProtocol> = {
+  capi: chatCompletionsProtocol,
+  "openai-completions": {
+    ...chatCompletionsProtocol,
+    normalizeRequest: coalesceAdjacentUserMessages,
+  },
+  "anthropic-messages": {
+    endpoint: anthropicMessagesEndpoint,
+    normalizeRequest: (body) =>
+      coalesceAdjacentUserMessages(
+        anthropicMessagesRequestToChatCompletion(body),
+      ),
+    responseBody: chatCompletionResponseToAnthropicMessage,
+    responseChunks: chatCompletionResponseToAnthropicSseChunks,
+    errorBody: (code, message) => {
+      const type = code ?? "rate_limited";
+      return { type: "error", error: { type, message } };
+    },
+  },
+  "openai-responses": {
+    endpoint: responsesEndpoint,
+    normalizeRequest: (body) =>
+      coalesceAdjacentUserMessages(responsesApiRequestToChatCompletion(body)),
+    responseBody: chatCompletionResponseToResponsesApiMessage,
+    responseChunks: chatCompletionResponseToResponsesApiSseChunks,
+  },
+};
+
+const modelEndpoints = new Set(
+  Object.values(replayProtocols).map((protocol) => protocol.endpoint),
+);
+
 const shellConfig =
   process.platform === "win32" ? ShellConfig.powerShell : ShellConfig.bash;
-const normalizedToolNames = {
+const normalizedToolNames: Record<string, string> = {
   [shellConfig.shellToolName]: "${shell}",
   [shellConfig.readShellToolName]: "${read_shell}",
   [shellConfig.writeShellToolName]: "${write_shell}",
@@ -53,11 +123,28 @@ const defaultModel = "claude-sonnet-4.5";
 export class ReplayingCapiProxy extends CapturingHttpProxy {
   private state: ReplayingCapiProxyState | null = null;
   private startPromise: Promise<string> | null = null;
+  private defaultToolResultNormalizers: ToolResultNormalizer[] = [
+    { toolName: "*", normalizer: normalizeLargeOutputFilepaths },
+    { toolName: "${shell}", normalizer: normalizeShellExitMarkers },
+    { toolName: "*", normalizer: normalizeGhAuthMessages },
+    { toolName: "*", normalizer: normalizeAvailableToolNames },
+    { toolName: "*", normalizer: normalizeBackgroundAgentStartMessage },
+    { toolName: "read_agent", normalizer: normalizeReadAgentResult },
+  ];
+
+  /**
+   * Per-token responses for `/copilot_internal/user` endpoint.
+   * Key is the Bearer token (without "Bearer " prefix), value is the response body.
+   * When a request arrives with `Authorization: Bearer <token>`, the matching response is returned.
+   * If no match is found, a 401 Unauthorized response is returned.
+   */
+  private copilotUserByToken = new Map<string, CopilotUserResponse>();
 
   /**
    * If true, cached responses are played back slowly (~ 2KiB/sec). Otherwise streaming responses are sent as fast as possible.
    */
   slowStreaming = false;
+  onStopRequested?: (skipWritingCache: boolean) => Promise<void> | void;
 
   constructor(
     targetUrl: string,
@@ -71,7 +158,13 @@ export class ReplayingCapiProxy extends CapturingHttpProxy {
     // skip the need to do a /config POST before other requests. This only makes
     // sense if the config will be static for the lifetime of the proxy.
     if (filePath && workDir) {
-      this.state = { filePath, workDir, testInfo, toolResultNormalizers: [] };
+      this.state = {
+        filePath,
+        workDir,
+        testInfo,
+        backend: "capi",
+        toolResultNormalizers: [...this.defaultToolResultNormalizers],
+      };
     }
   }
 
@@ -88,8 +181,14 @@ export class ReplayingCapiProxy extends CapturingHttpProxy {
     }
 
     // Since we're about to switch to a new file, write out any captured exchanges
-    // Note that the final call to stop() will also write out any remaining exchanges
-    if (this.state) {
+    // Note that the final call to stop() will also write out any remaining exchanges.
+    // In CI mode (GITHUB_ACTIONS=true) we never write — the snapshots are read-only.
+    // Otherwise tests that exercise only a subset of a multi-conversation snapshot
+    // would silently overwrite the file with that subset, breaking subsequent runs.
+    if (
+      this.state?.backend === "capi" &&
+      process.env.GITHUB_ACTIONS !== "true"
+    ) {
       await writeCapturesToDisk(this.exchanges, this.state);
     }
 
@@ -97,7 +196,8 @@ export class ReplayingCapiProxy extends CapturingHttpProxy {
       filePath: config.filePath,
       workDir: config.workDir,
       testInfo: config.testInfo,
-      toolResultNormalizers: [],
+      backend: parseReplayBackend(config.backend),
+      toolResultNormalizers: [...this.defaultToolResultNormalizers],
     };
 
     this.clearExchanges();
@@ -108,13 +208,26 @@ export class ReplayingCapiProxy extends CapturingHttpProxy {
     if (this.state && existsSync(this.state.filePath)) {
       const content = await readFile(this.state.filePath, "utf-8");
       this.state.storedData = yaml.parse(content) as NormalizedData;
+      normalizeToolResultOrder(this.state.storedData.conversations);
+      normalizeStoredUserMessages(this.state.storedData.conversations);
+      normalizeStoredToolMessages(this.state.storedData.conversations);
+      normalizeStoredMessagesForBackend(
+        this.state.storedData.conversations,
+        this.state.backend,
+      );
     }
   }
 
   async stop(skipWritingCache?: boolean): Promise<void> {
     await super.stop();
 
-    if (this.state && !skipWritingCache) {
+    // CAPI is the authoritative capture path. BYOK modes only verify that the
+    // same canonical snapshots replay through each provider protocol.
+    if (
+      this.state?.backend === "capi" &&
+      !skipWritingCache &&
+      process.env.GITHUB_ACTIONS !== "true"
+    ) {
       await writeCapturesToDisk(this.exchanges, this.state);
     }
   }
@@ -132,6 +245,14 @@ export class ReplayingCapiProxy extends CapturingHttpProxy {
     this.state.toolResultNormalizers.push({ toolName, normalizer });
   }
 
+  /**
+   * Register a per-token response for the `/copilot_internal/user` endpoint.
+   * When a request with `Authorization: Bearer <token>` arrives, the matching response is returned.
+   */
+  setCopilotUserByToken(token: string, response: CopilotUserResponse): void {
+    this.copilotUserByToken.set(token, response);
+  }
+
   override performRequest(options: PerformRequestOptions): void {
     void iife(async () => {
       const commonResponseHeaders = {
@@ -139,6 +260,21 @@ export class ReplayingCapiProxy extends CapturingHttpProxy {
       };
 
       try {
+        // Handle /copilot-user-config endpoint for configuring per-token user responses
+        if (
+          options.requestOptions.path === "/copilot-user-config" &&
+          options.requestOptions.method === "POST"
+        ) {
+          const config = JSON.parse(options.body!) as {
+            token: string;
+            response: CopilotUserResponse;
+          };
+          this.copilotUserByToken.set(config.token, config.response);
+          options.onResponseStart(200, {});
+          options.onResponseEnd();
+          return;
+        }
+
         // Handle /config endpoint for updating proxy configuration
         if (
           options.requestOptions.path === "/config" &&
@@ -160,6 +296,7 @@ export class ReplayingCapiProxy extends CapturingHttpProxy {
           );
           options.onResponseStart(200, {});
           options.onResponseEnd();
+          await this.onStopRequested?.(skipWritingCache);
           await this.stop(skipWritingCache);
           process.exit(0);
         }
@@ -169,17 +306,86 @@ export class ReplayingCapiProxy extends CapturingHttpProxy {
           options.requestOptions.path === "/exchanges" &&
           options.requestOptions.method === "GET"
         ) {
-          const chatCompletionExchanges = this.exchanges.filter(
-            (e) => e.request.url === chatCompletionEndpoint,
-          );
+          const protocol =
+            replayProtocols[this.state?.backend ?? "capi"];
           const parsedExchanges = await Promise.all(
-            chatCompletionExchanges.map((e) =>
-              parseHttpExchange(e.request.body, e.response?.body),
-            ),
+            this.exchanges
+              .filter((exchange) => exchange.request.url === protocol.endpoint)
+              .map((exchange) =>
+                parseHttpExchange(
+                  protocol.normalizeRequest?.(exchange.request.body) ??
+                    exchange.request.body,
+                  protocol.canonicalResponse
+                    ? exchange.response?.body
+                    : undefined,
+                  exchange.request.headers,
+                ),
+              ),
           );
           options.onResponseStart(200, {});
           options.onData(Buffer.from(JSON.stringify(parsedExchanges)));
           options.onResponseEnd();
+          return;
+        }
+
+        // Handle /requests endpoint for retrieving all captured outbound requests.
+        if (
+          options.requestOptions.path === "/requests" &&
+          options.requestOptions.method === "GET"
+        ) {
+          const requests = this.exchanges
+            .map((exchange) => exchange.request)
+            .filter((request) => request.url !== "/requests");
+          options.onResponseStart(200, { "content-type": "application/json" });
+          options.onData(Buffer.from(JSON.stringify(requests)));
+          options.onResponseEnd();
+          return;
+        }
+
+        // Handle /copilot_internal/user endpoint for per-session auth.
+        // This must run before the state guard below: the CLI authenticates and
+        // calls /copilot_internal/user at startup, which can race ahead of the
+        // per-test POST /config (e.g. the Go harness spawns the CLI before the
+        // first ConfigureForTest). The response only depends on the token map,
+        // which is populated independently of `state`.
+        if (options.requestOptions.path === "/copilot_internal/user") {
+          const headers = options.requestOptions.headers;
+          const headerMap = headers as
+            | Record<string, string | string[] | number | undefined>
+            | undefined;
+          const rawAuthHeader = Array.isArray(headers)
+            ? undefined
+            : (headerMap?.authorization ?? headerMap?.Authorization);
+          const authHeader = Array.isArray(rawAuthHeader)
+            ? rawAuthHeader[0]
+            : typeof rawAuthHeader === "string"
+              ? rawAuthHeader
+              : undefined;
+          const token = authHeader?.replace("Bearer ", "");
+          const registered = token
+            ? this.copilotUserByToken.get(token)
+            : undefined;
+          // The CLI gates third-party MCP servers behind the copilot user's
+          // `is_mcp_enabled` flag (a null/missing value disables them). Default
+          // it to true so e2e MCP servers are enabled unless a test opts out.
+          const userResponse = registered
+            ? ({ is_mcp_enabled: true, ...registered } as CopilotUserResponse)
+            : undefined;
+          if (userResponse) {
+            const headers = {
+              "content-type": "application/json",
+              ...commonResponseHeaders,
+            };
+            options.onResponseStart(200, headers);
+            options.onData(Buffer.from(JSON.stringify(userResponse)));
+            options.onResponseEnd();
+          } else {
+            options.onResponseStart(401, commonResponseHeaders);
+            options.onData(
+              Buffer.from(JSON.stringify({ message: "Bad credentials" })),
+            );
+            options.onResponseEnd();
+          }
           return;
         }
 
@@ -230,74 +436,183 @@ export class ReplayingCapiProxy extends CapturingHttpProxy {
           options.onResponseEnd();
           return;
         }
-
-        // Handle /chat/completions endpoint
+        const requestPath = options.requestOptions.path ?? "";
+        const protocol = replayProtocols[state.backend];
         if (
-          state.storedData &&
-          options.requestOptions.path === chatCompletionEndpoint &&
-          options.body
+          modelEndpoints.has(requestPath) &&
+          state.backend !== "capi" &&
+          requestPath !== protocol.endpoint
         ) {
+          const message = `Expected ${protocol.endpoint} for backend ${state.backend}, received ${requestPath}`;
+          options.onResponseStart(400, {
+            "content-type": "application/json",
+            ...commonResponseHeaders,
+          });
+          options.onData(
+            Buffer.from(
+              JSON.stringify({
+                error: { type: "protocol_mismatch", message },
+              }),
+            ),
+          );
+          options.onResponseEnd();
+          return;
+        }
+
+        const isModelRequest = requestPath === protocol.endpoint;
+        // Every protocol enters the existing Chat Completions snapshot matcher.
+        const normalizedBody =
+          isModelRequest && options.body
+            ? (protocol.normalizeRequest?.(options.body) ?? options.body)
+            : options.body;
+        if (state.storedData && isModelRequest && normalizedBody) {
+          const streamingIsRequested =
+            (JSON.parse(normalizedBody) as { stream?: boolean }).stream === true;
+
+          const savedError = await findSavedChatCompletionError(
+            state.storedData,
+            normalizedBody,
+            state.workDir,
+            state.toolResultNormalizers,
+          );
+
+          if (savedError) {
+            const headers = {
+              "content-type": "application/json",
+              ...commonResponseHeaders,
+              ...(savedError.retryAfterSeconds !== undefined
+                ? { "retry-after": String(savedError.retryAfterSeconds) }
+                : {}),
+            };
+            options.onResponseStart(savedError.status, headers);
+            options.onData(
+              Buffer.from(
+                JSON.stringify(
+                  (protocol.errorBody ?? openAIErrorBody)(
+                    savedError.code,
+                    savedError.message ?? "Rate limited by test snapshot",
+                  ),
+                ),
+              ),
+            );
+            options.onResponseEnd();
+            return;
+          }
+
           const savedResponse = await findSavedChatCompletionResponse(
             state.storedData,
-            options.body,
+            normalizedBody,
             state.workDir,
             state.toolResultNormalizers,
           );
 
           if (savedResponse) {
-            const streamingIsRequested =
-              options.body &&
-              (JSON.parse(options.body) as { stream?: boolean }).stream ===
-                true;
+            await this.respondWithProtocol(
+              options,
+              protocol,
+              savedResponse,
+              streamingIsRequested,
+              commonResponseHeaders,
+            );
 
-            if (streamingIsRequested) {
-              const headers = {
-                "content-type": "text/event-stream",
-                ...commonResponseHeaders,
-              };
-              options.onResponseStart(200, headers);
-              for (const chunk of convertToStreamingResponseChunks(
-                savedResponse,
-              )) {
-                options.onData(
-                  Buffer.from(`data: ${JSON.stringify(chunk)}\n\n`),
-                );
-                if (this.slowStreaming) {
-                  await sleep(100);
-                }
-              }
-              options.onData(Buffer.from("data: [DONE]\n\n"));
-              options.onResponseEnd();
-            } else {
-              const body = JSON.stringify(savedResponse);
-              const headers = {
-                "content-type": "application/json",
-                ...commonResponseHeaders,
-              };
-              options.onResponseStart(200, headers);
-              options.onData(Buffer.from(body));
-              options.onResponseEnd();
-            }
+            return;
+          }
 
+          // Check if this request matches a snapshot with no response (e.g., timeout tests).
+          // If so, hang forever so the client-side timeout can trigger.
+          if (
+            await isRequestOnlySnapshot(
+              state.storedData,
+              normalizedBody,
+              state.workDir,
+              state.toolResultNormalizers,
+            )
+          ) {
+            const headers = {
+              "content-type": streamingIsRequested
+                ? "text/event-stream"
+                : "application/json",
+              ...commonResponseHeaders,
+            };
+            options.onResponseStart(200, headers);
+            // Never call onResponseEnd - hang indefinitely for timeout tests.
+            // Returning here keeps the HTTP response open without leaking a pending Promise.
             return;
           }
         }
 
+        // Beyond this point, we're only going to be able to supply responses in CI if we have a snapshot,
+        // and we only store snapshots for chat completion. For anything else (e.g., custom-agents fetches),
+        // return 404 so the CLI treats them as unavailable instead of erroring.
+        if (!isModelRequest) {
+          const headers = {
+            "content-type": "application/json",
+            "x-github-request-id": "proxy-not-found",
+          };
+          options.onResponseStart(404, headers);
+          options.onData(
+            Buffer.from(JSON.stringify({ error: "Not found by test proxy" })),
+          );
+          options.onResponseEnd();
+          return;
+        }
+
         // Fallback to normal proxying if no cached response found
         // This implicitly captures the new exchange too
-        if (process.env.CI === "true") {
+        const isCI = process.env.GITHUB_ACTIONS === "true";
+        if (isCI || state.backend !== "capi") {
           await exitWithNoMatchingRequestError(
             options,
             state.testInfo,
             state.workDir,
             state.toolResultNormalizers,
+            state.storedData,
+            normalizedBody,
           );
+          return;
         }
         super.performRequest(options);
       } catch (err) {
         options.onError(err as Error | string);
       }
     });
+  }
+
+  private async respondWithProtocol(
+    options: PerformRequestOptions,
+    protocol: ReplayProtocol,
+    response: ChatCompletion,
+    streaming: boolean,
+    commonHeaders: Record<string, string>,
+  ): Promise<void> {
+    if (!streaming) {
+      options.onResponseStart(200, {
+        "content-type": "application/json",
+        ...commonHeaders,
+      });
+      options.onData(
+        Buffer.from(
+          JSON.stringify(protocol.responseBody?.(response) ?? response),
+        ),
+      );
+      options.onResponseEnd();
+      return;
+    }
+
+    options.onResponseStart(200, {
+      "content-type": "text/event-stream",
+      ...commonHeaders,
+    });
+    for (const chunk of protocol.responseChunks(response)) {
+      options.onData(Buffer.from(chunk));
+      if (this.slowStreaming) {
+        await sleep(100);
+      }
+    }
+    if (protocol.responseEndChunk) {
+      options.onData(Buffer.from(protocol.responseEndChunk));
+    }
+    options.onResponseEnd();
   }
 }
 
@@ -310,6 +625,19 @@ async function writeCapturesToDisk(
     state.workDir,
     state.toolResultNormalizers,
   );
+  const preservedErrors = state.storedData?.errors;
+  if (preservedErrors && preservedErrors.length > 0) {
+    data.errors = preservedErrors;
+    data.models = [
+      ...new Set([
+        ...(state.storedData?.models ?? []),
+        ...data.models,
+        ...preservedErrors
+          .map((error) => error.model)
+          .filter((model): model is string => model !== undefined),
+      ]),
+    ];
+  }
   if (data.conversations.length > 0) {
     let yamlText = yaml.stringify(data, { lineWidth: 120 });
 
@@ -324,36 +652,123 @@ async function writeCapturesToDisk(
   }
 }
 
+/**
+ * Produces a human-readable explanation of why no stored conversation matched
+ * a given request. For each stored conversation it reports the first reason
+ * matching failed, mirroring the logic in {@link findAssistantIndexAfterPrefix}.
+ */
+function diagnoseMatchFailure(
+  requestMessages: NormalizedMessage[],
+  rawMessages: unknown[],
+  storedData: NormalizedData | undefined,
+): string {
+  const lines: string[] = [];
+  lines.push(
+    `Request has ${requestMessages.length} normalized messages (${rawMessages.length} raw).`,
+  );
+
+  if (!storedData || storedData.conversations.length === 0) {
+    lines.push("No stored conversations to match against.");
+    return lines.join("\n");
+  }
+
+  for (let c = 0; c < storedData.conversations.length; c++) {
+    const saved = storedData.conversations[c].messages;
+
+    // Same check as findAssistantIndexAfterPrefix: request must be a strict prefix
+    if (requestMessages.length >= saved.length) {
+      lines.push(
+        `Conversation ${c} (${saved.length} messages): ` +
+          `skipped — request has ${requestMessages.length} messages, need fewer than ${saved.length}.`,
+      );
+      continue;
+    }
+
+    // Find the first message that doesn't match
+    let mismatchIndex = -1;
+    for (let i = 0; i < requestMessages.length; i++) {
+      if (JSON.stringify(requestMessages[i]) !== JSON.stringify(saved[i])) {
+        mismatchIndex = i;
+        break;
+      }
+    }
+
+    if (mismatchIndex >= 0) {
+      const raw =
+        mismatchIndex < rawMessages.length
+          ? JSON.stringify(rawMessages[mismatchIndex]).slice(0, 300)
+          : "(no raw message)";
+      lines.push(
+        `Conversation ${c} (${saved.length} messages): mismatch at message ${mismatchIndex}:`,
+        `  request:    ${JSON.stringify(requestMessages[mismatchIndex]).slice(0, 200)}`,
+        `  saved:      ${JSON.stringify(saved[mismatchIndex]).slice(0, 200)}`,
+        `  raw (pre-normalization): ${raw}`,
+      );
+    } else {
+      // Prefix matched, but the next saved message isn't an assistant turn
+      const nextRole =
+        saved[requestMessages.length]?.role ?? "(end of conversation)";
+      lines.push(
+        `Conversation ${c} (${saved.length} messages): ` +
+          `prefix matched, but next saved message is "${nextRole}" (need "assistant").`,
+      );
+    }
+  }
+
+  return lines.join("\n");
+}
+
 async function exitWithNoMatchingRequestError(
   options: PerformRequestOptions,
   testInfo: { file: string; line?: number } | undefined,
   workDir: string,
   toolResultNormalizers: ToolResultNormalizer[],
+  storedData?: NormalizedData,
+  requestBody?: string,
 ) {
-  const parts: string[] = [];
-  if (testInfo?.file) parts.push(`file=${testInfo.file}`);
-  if (typeof testInfo?.line === "number") parts.push(`line=${testInfo.line}`);
-  const header = parts.length ? ` ${parts.join(",")}` : "";
-
-  let finalMessageInfo: string;
+  let diagnostics: string;
   try {
     const normalized = await parseAndNormalizeRequest(
-      options.body,
+      requestBody ?? options.body,
       workDir,
       toolResultNormalizers,
     );
-    const normalizedMessages = normalized.conversations[0]?.messages ?? [];
-    finalMessageInfo = JSON.stringify(
-      normalizedMessages[normalizedMessages.length - 1],
+    const requestMessages = normalized.conversations[0]?.messages ?? [];
+
+    let rawMessages: unknown[] = [];
+    try {
+      rawMessages =
+        (
+          JSON.parse(requestBody ?? options.body ?? "{}") as {
+            messages?: unknown[];
+          }
+        ).messages ?? [];
+    } catch {
+      /* non-JSON body */
+    }
+
+    diagnostics = diagnoseMatchFailure(
+      requestMessages,
+      rawMessages,
+      storedData,
     );
-  } catch {
-    finalMessageInfo = `(unable to parse request body: ${options.body?.slice(0, 200) ?? "empty"})`;
+  } catch (e) {
+    diagnostics = `(unable to parse request for diagnostics: ${e})`;
   }
 
-  const errorMessage =
-    `No cached response found for ${options.requestOptions.method} ${options.requestOptions.path}. ` +
-    `Final message: ${finalMessageInfo}`;
-  process.stderr.write(`::error${header}::${errorMessage}\n`);
+  const errorMessage = `No cached response found for ${options.requestOptions.method} ${options.requestOptions.path}.\n${diagnostics}`;
+
+  // Format as GitHub Actions annotation when test location is available
+  const annotation = [
+    testInfo?.file ? `file=${testInfo.file}` : "",
+    typeof testInfo?.line === "number" ? `line=${testInfo.line}` : "",
+  ]
+    .filter(Boolean)
+    .join(",");
+  process.stderr.write(
+    `::error${annotation ? ` ${annotation}` : ""}::${errorMessage}\n`,
+  );
+
   options.onError(new Error(errorMessage));
 }
 
@@ -394,6 +809,66 @@ async function findSavedChatCompletionResponse(
   return undefined;
 }
 
+async function findSavedChatCompletionError(
+  storedData: NormalizedData,
+  requestBody: string | undefined,
+  workDir: string,
+  toolResultNormalizers: ToolResultNormalizer[],
+): Promise<NormalizedErrorResponse | undefined> {
+  const normalized = await parseAndNormalizeRequest(
+    requestBody,
+    workDir,
+    toolResultNormalizers,
+  );
+  const requestMessages = normalized.conversations[0]?.messages ?? [];
+  const requestModel = normalized.models[0];
+
+  for (const error of storedData.errors ?? []) {
+    if (error.model && error.model !== requestModel) {
+      continue;
+    }
+    if (
+      requestMessages.length === error.messages.length &&
+      requestMessages.every(
+        (msg, i) => JSON.stringify(msg) === JSON.stringify(error.messages[i]),
+      )
+    ) {
+      return error;
+    }
+  }
+
+  return undefined;
+}
+
+// Checks if the request matches a snapshot that has no assistant response.
+// This handles timeout test scenarios where the snapshot only records the request.
+async function isRequestOnlySnapshot(
+  storedData: NormalizedData,
+  requestBody: string | undefined,
+  workDir: string,
+  toolResultNormalizers: ToolResultNormalizer[],
+): Promise<boolean> {
+  const normalized = await parseAndNormalizeRequest(
+    requestBody,
+    workDir,
+    toolResultNormalizers,
+  );
+  const requestMessages = normalized.conversations[0]?.messages ?? [];
+
+  for (const conversation of storedData.conversations) {
+    if (
+      requestMessages.length === conversation.messages.length &&
+      requestMessages.every(
+        (msg, i) =>
+          JSON.stringify(msg) === JSON.stringify(conversation.messages[i]),
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 async function parseAndNormalizeRequest(
   requestBody: string | undefined,
   workDir: string,
@@ -431,8 +906,63 @@ async function transformHttpExchanges(
   );
 
   normalizeToolCalls(dedupedExchanges, toolResultNormalizers);
+  normalizeToolResultOrder(dedupedExchanges);
   normalizeFilenames(dedupedExchanges, workDir);
   return { models: Array.from(dedupedModels), conversations: dedupedExchanges };
+}
+
+function parseReplayBackend(value: unknown): ReplayBackend {
+  if (value === undefined || value === null || value === "") return "capi";
+  if (typeof value === "string" && Object.hasOwn(replayProtocols, value)) {
+    return value as ReplayBackend;
+  }
+  throw new Error(`Unsupported replay backend: ${String(value)}`);
+}
+
+function coalesceAdjacentUserMessages(requestBody: string): string {
+  const request = JSON.parse(requestBody) as {
+    messages?: Array<{
+      role?: string;
+      content?: unknown;
+      [key: string]: unknown;
+    }>;
+  };
+  if (!request.messages) return requestBody;
+
+  const messages: NonNullable<typeof request.messages> = [];
+  for (const message of request.messages) {
+    const previous = messages.at(-1);
+    if (
+      previous?.role === "user" &&
+      message.role === "user" &&
+      typeof previous.content === "string" &&
+      typeof message.content === "string"
+    ) {
+      previous.content = `${previous.content.trimEnd()}\n\n\n${message.content.trimStart()}`;
+    } else {
+      messages.push(message);
+    }
+  }
+
+  for (const message of messages) {
+    if (message.role === "user" && typeof message.content === "string") {
+      message.content = normalizeUserMessage(message.content).replace(
+        /\n{5,}/g,
+        "\n\n\n",
+      );
+    }
+  }
+
+  request.messages = messages;
+  return JSON.stringify(request);
+}
+
+function openAIErrorBody(
+  code: string | undefined,
+  message: string,
+): unknown {
+  const type = code ?? "rate_limited";
+  return { error: { message, type, code: type } };
 }
 
 function normalizeFilenames(
@@ -520,7 +1050,10 @@ function normalizeToolCalls(
             .find((tc) => tc.id === msg.tool_call_id);
           if (precedingToolCall) {
             for (const normalizer of resultNormalizers) {
-              if (precedingToolCall.function?.name === normalizer.toolName) {
+              if (
+                precedingToolCall.function?.name === normalizer.toolName ||
+                normalizer.toolName === "*"
+              ) {
                 msg.content = normalizer.normalizer(msg.content);
               }
             }
@@ -531,6 +1064,51 @@ function normalizeToolCalls(
       precedingMessages.push(msg);
     }
   }
+}
+
+function normalizeToolResultOrder(conversations: NormalizedConversation[]) {
+  for (const conv of conversations) {
+    for (let start = 0; start < conv.messages.length; ) {
+      if (conv.messages[start].role !== "tool") {
+        start++;
+        continue;
+      }
+
+      let end = start + 1;
+      while (end < conv.messages.length && conv.messages[end].role === "tool") {
+        end++;
+      }
+
+      conv.messages
+        .slice(start, end)
+        .sort(compareToolResultMessages)
+        .forEach((message, index) => {
+          conv.messages[start + index] = message;
+        });
+      start = end;
+    }
+  }
+}
+
+function compareToolResultMessages(
+  left: NormalizedMessage,
+  right: NormalizedMessage,
+) {
+  return compareToolCallIds(left.tool_call_id, right.tool_call_id);
+}
+
+function compareToolCallIds(left?: string, right?: string) {
+  const leftNumber = parseNormalizedToolCallId(left);
+  const rightNumber = parseNormalizedToolCallId(right);
+  if (leftNumber !== undefined && rightNumber !== undefined) {
+    return leftNumber - rightNumber;
+  }
+  return (left ?? "").localeCompare(right ?? "");
+}
+
+function parseNormalizedToolCallId(id?: string) {
+  const match = id?.match(/^toolcall_(\d+)$/);
+  return match ? Number(match[1]) : undefined;
 }
 
 // As we capture LLM calls, we see:
@@ -570,10 +1148,11 @@ function isPrefix(
 async function parseHttpExchange(
   requestBody: string,
   responseBody: string | undefined,
+  requestHeaders?: Record<string, string | string[] | undefined>,
 ): Promise<ParsedHttpExchange> {
   const request = JSON.parse(requestBody) as ChatCompletionCreateParamsBase;
   const response = await parseOpenAIResponse(responseBody);
-  return { request, response };
+  return { request, response, requestHeaders };
 }
 
 // Converts a single HTTP exchange (request + response) into a normalized conversation
@@ -605,10 +1184,41 @@ function transformOpenAIRequestMessage(
     content = "${system}";
   } else if (m.role === "user" && typeof m.content === "string") {
     content = normalizeUserMessage(m.content);
+  } else if (m.role === "user" && Array.isArray(m.content)) {
+    // Multimodal user messages have array content with text and image_url parts.
+    // Extract and normalize text parts; represent image_url parts as a stable marker.
+    const parts: string[] = [];
+    for (const part of m.content) {
+      if (
+        typeof part === "object" &&
+        part.type === "text" &&
+        typeof part.text === "string"
+      ) {
+        parts.push(normalizeUserMessage(part.text));
+      } else if (typeof part === "object" && part.type === "image_url") {
+        parts.push("[image]");
+      }
+    }
+    content = parts.join("\n") || undefined;
   } else if (m.role === "tool" && typeof m.content === "string") {
-    // If it's a JSON tool call result, normalize the whitespace and property ordering
+    // If it's a JSON tool call result, normalize the whitespace and property ordering.
+    // For successful tool results wrapped in {resultType, textResultForLlm}, unwrap to
+    // just the inner value so snapshots stay stable across envelope format changes.
     try {
-      content = JSON.stringify(sortJsonKeys(JSON.parse(m.content)));
+      const parsed = JSON.parse(m.content);
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        parsed.resultType === "success" &&
+        "textResultForLlm" in parsed
+      ) {
+        content =
+          typeof parsed.textResultForLlm === "string"
+            ? parsed.textResultForLlm
+            : JSON.stringify(sortJsonKeys(parsed.textResultForLlm));
+      } else {
+        content = JSON.stringify(sortJsonKeys(parsed));
+      }
     } catch {
       content = m.content.trim();
     }
@@ -628,9 +1238,220 @@ function transformOpenAIRequestMessage(
 }
 
 function normalizeUserMessage(content: string): string {
-  return content
+  return normalizeSkillContextFrontmatter(content)
+    .replace(
+      taskCompletionNotificationPattern,
+      taskCompletionNotificationReplacement,
+    )
     .replace(/<current_datetime>.*?<\/current_datetime>/g, "")
+    .replace(/<reminder>[\s\S]*?<\/reminder>/g, "")
+    .replace(/<system_reminder>[\s\S]*?<\/system_reminder>/g, "")
+    .replace(/<agent_instructions>[\s\S]*?<\/agent_instructions>/g, "")
+    .replace(/^\s*\[\[PLAN\]\]\s*/, "")
+    .replace(
+      /Please create a detailed summary of the conversation so far\. The history is being compacted[\s\S]*/,
+      "${compaction_prompt}",
+    )
     .trim();
+}
+
+const taskCompletionNotificationPattern =
+  /Agent "([^"]+)" \(([^)]+)\) (?:has completed successfully|has finished processing and is now idle)\. Use read_agent with agent_id "[^"]+" to (?:retrieve (?:unread results|the full results)|read the results, or write_agent to send follow-up messages)\./g;
+const taskCompletionNotificationReplacement =
+  'Agent "$1" ($2) has completed successfully. Use read_agent with agent_id "$1" to retrieve the full results.';
+
+function normalizeStoredUserMessages(conversations: NormalizedConversation[]) {
+  for (const conversation of conversations) {
+    for (const message of conversation.messages) {
+      if (message.role === "user" && typeof message.content === "string") {
+        message.content = message.content.replace(
+          taskCompletionNotificationPattern,
+          taskCompletionNotificationReplacement,
+        );
+      }
+    }
+  }
+}
+
+function normalizeStoredMessagesForBackend(
+  conversations: NormalizedConversation[],
+  backend: ReplayBackend,
+) {
+  if (backend === "capi") return;
+
+  for (const conversation of conversations) {
+    conversation.messages = coalesceMessages(
+      conversation.messages,
+      backend !== "openai-completions",
+    );
+  }
+}
+
+function coalesceMessages(
+  messages: NormalizedMessage[],
+  coalesceAssistantMessages: boolean,
+): NormalizedMessage[] {
+  const result: NormalizedMessage[] = [];
+  for (const message of messages) {
+    const previous = result.at(-1);
+    const shouldCoalesce =
+      previous?.role === message.role &&
+      ((coalesceAssistantMessages && message.role === "assistant") ||
+        message.role === "user");
+    if (!shouldCoalesce) {
+      result.push(message);
+      continue;
+    }
+
+    const separator = message.role === "user" ? "\n\n\n" : "";
+    const previousContent = previous.content ?? "";
+    const currentContent = message.content ?? "";
+    const content = `${previousContent}${previousContent && currentContent ? separator : ""}${currentContent}`;
+    if (content) previous.content = content;
+
+    const toolCalls = [
+      ...(previous.tool_calls ?? []),
+      ...(message.tool_calls ?? []),
+    ];
+    if (toolCalls.length) previous.tool_calls = toolCalls;
+  }
+  return result;
+}
+
+// Apply runtime-dependent tool result normalization to snapshots recorded by
+// older CLI versions as well as to live requests.
+function normalizeStoredToolMessages(conversations: NormalizedConversation[]) {
+  for (const conversation of conversations) {
+    for (const message of conversation.messages) {
+      if (message.role === "tool" && typeof message.content === "string") {
+        message.content = normalizeAvailableToolNames(message.content);
+        message.content = normalizeBackgroundAgentStartMessage(message.content);
+        message.content = normalizeReadAgentResult(message.content);
+      }
+    }
+  }
+}
+
+function normalizeSkillContextFrontmatter(content: string): string {
+  // Runtime versions may include or omit SKILL.md metadata in the prompt context.
+  return content.replace(
+    /(<skill-context\b[^>]*>\s*Base directory for this skill:[^\r\n]*(?:\r?\n)+)---\r?\n(?:(?!<\/skill-context>)[\s\S])*?\r?\n---(?:\r?\n)+/g,
+    "$1",
+  );
+}
+
+function normalizeLargeOutputFilepaths(result: string): string {
+  // Replaces filenames like 1774637043987-copilot-tool-output-tk7puw.txt with PLACEHOLDER-copilot-tool-output-PLACEHOLDER
+  return result
+    .replace(
+      /\d+-copilot-tool-output-[a-z0-9.]+/g,
+      "PLACEHOLDER-copilot-tool-output-PLACEHOLDER",
+    )
+    .replace(
+      /(?:[A-Za-z]:)?[^\s"'`]*[\\/]session-state[\\/]temp[\\/]PLACEHOLDER-copilot-tool-output-PLACEHOLDER/g,
+      "/session-state/temp/PLACEHOLDER-copilot-tool-output-PLACEHOLDER",
+    );
+}
+
+function normalizeShellExitMarkers(result: string): string {
+  return result.replace(
+    /<shellId:\s*[^>\r\n]+?\s+completed with exit code (-?\d+)>/g,
+    "<exited with exit code $1>",
+  );
+}
+
+// The `gh` CLI emits different "not authenticated" help text depending on the
+// environment (local dev vs. inside GitHub Actions). Normalize both forms to a
+// stable placeholder so snapshots don't drift between environments.
+function normalizeGhAuthMessages(result: string): string {
+  let normalized = result;
+  // GitHub Actions form
+  normalized = normalized.replace(
+    /gh: To use GitHub CLI in a GitHub Actions workflow, set the GH_TOKEN environment variable\. Example:\s*\n\s*env:\s*\n\s*GH_TOKEN: \$\{\{ github\.token \}\}/g,
+    "${gh_auth_required}",
+  );
+  // Local dev form
+  normalized = normalized.replace(
+    /To get started with GitHub CLI, please run:\s*gh auth login\s*\n\s*Alternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token\./g,
+    "${gh_auth_required}",
+  );
+  // When the GitHub CLI is run under the local CONNECT proxy on Windows, it
+  // can try its auth probe before trusting the generated CA. This is still the
+  // same unauthenticated-GitHub condition from the snapshot's perspective.
+  normalized = normalized.replace(
+    /[^\n]*Post "https:\/\/api\.github\.com\/graphql": tls: failed to verify certificate: x509: certificate signed by unknown authority\s*\n<exited with exit code 1>/g,
+    "${gh_auth_required}\n<exited with exit code 4>",
+  );
+  return normalizeGh401AuthMessages(normalized);
+}
+
+function normalizeGh401AuthMessages(result: string): string {
+  const lines = result.split(/\r?\n/);
+  const normalizedLines: string[] = [];
+  let changed = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    if (
+      /(?:HTTP|GraphQL)[ \t:]+401/.test(lines[i]) &&
+      lines[i].includes("Requires authentication")
+    ) {
+      let replaced = false;
+      for (let j = i + 1; j < lines.length; j++) {
+        if (/^<exited with exit code \d+>$/.test(lines[j].trim())) {
+          normalizedLines.push("${gh_auth_required}");
+          normalizedLines.push("<exited with exit code 4>");
+          i = j;
+          changed = true;
+          replaced = true;
+          break;
+        }
+      }
+      if (replaced) {
+        continue;
+      }
+    }
+    normalizedLines.push(lines[i]);
+  }
+
+  return changed ? normalizedLines.join("\n") : result;
+}
+
+function normalizeReadAgentResult(result: string): string {
+  const normalized = result
+    .replace(
+      /^Agent is idle \(waiting for messages\)\./,
+      "Agent completed.",
+    )
+    .replace(/^Agent completed\. (.*), status: idle,/, "Agent completed. $1, status: completed,")
+    .replace(
+      /, total_turns: \d+(?=\r?\n|$)/,
+      ", total_turns: 0, duration: 0s",
+    )
+    .replace(/\r?\n\r?\n\[Turn \d+\]\r?\n/, "\n\n");
+
+  return normalized
+    .replace(/\belapsed: \d+(?:\.\d+)?s\b/g, "elapsed: 0s")
+    .replace(/\bduration: \d+(?:\.\d+)?s\b/g, "duration: 0s");
+}
+
+// When a model calls a tool that doesn't exist (e.g., the removed report_intent
+// tool), the runtime replies with "Available tools that can be called are <list>."
+// That enumeration is both platform-specific (shell tool family names differ
+// across OSes) and runtime-version-specific (built-in tools such as write_agent
+// are added or removed over time). Some runtime builds omit the enumeration
+// entirely, so remove the optional suffix and retain only the stable error.
+function normalizeAvailableToolNames(result: string): string {
+  return result.replace(
+    /(Tool '[^']+' does not exist\.) Available tools that can be called are [^.]*\./g,
+    "$1",
+  );
+}
+
+function normalizeBackgroundAgentStartMessage(result: string): string {
+  return result.replace(
+    /^(Agent started in background with agent_id: .*?\. You'll be notified when it completes\. Tell the user you're waiting and end your response, or continue unrelated work until notified\.).*$/s,
+    "$1",
+  );
 }
 
 // Transforms a single OpenAI-style inbound response message into normalized form
@@ -720,7 +1541,11 @@ function findAssistantIndexAfterPrefix(
   requestMessages: NormalizedMessage[],
   savedMessages: NormalizedMessage[],
 ): number | undefined {
+  const logFile = process.env.PROXY_DEBUG_LOG;
+  const log = (msg: string) => { if (logFile) try { appendFileSync(logFile, msg + "\n"); } catch {} };
+
   if (requestMessages.length >= savedMessages.length) {
+    log(`prefix check failed: request.length=${requestMessages.length} >= saved.length=${savedMessages.length}`);
     return undefined;
   }
 
@@ -728,6 +1553,9 @@ function findAssistantIndexAfterPrefix(
     const reqMsg = JSON.stringify(requestMessages[i]);
     const savedMsg = JSON.stringify(savedMessages[i]);
     if (reqMsg !== savedMsg) {
+      log(`mismatch at index ${i}:`);
+      log(`  REQ:   ${reqMsg.substring(0, 1000)}`);
+      log(`  SAVED: ${savedMsg.substring(0, 1000)}`);
       return undefined;
     }
   }
@@ -738,9 +1566,11 @@ function findAssistantIndexAfterPrefix(
     nextIndex < savedMessages.length &&
     savedMessages[nextIndex].role === "assistant"
   ) {
+    log(`MATCH found at index ${nextIndex}`);
     return nextIndex;
   }
 
+  log(`no assistant at nextIndex=${nextIndex}, saved.length=${savedMessages.length}`);
   return undefined;
 }
 
@@ -888,9 +1718,7 @@ function convertToStreamingResponseChunks(
   return chunks;
 }
 
-function createGetModelsResponse(modelIds: string[]): {
-  data: Awaited<ReturnType<typeof retrieveAvailableModels>>;
-} {
+function createGetModelsResponse(modelIds: string[]) {
   // Obviously the following might not match any given model. We could track the original responses from /models,
   // but that risks invalidating the caches too frequently and making this unmaintainable. If this approximation
   // turns out to be insufficient, we can tweak the logic here based on known model IDs.
@@ -927,9 +1755,37 @@ export type ToolResultNormalizer = {
   normalizer: (result: string) => string;
 };
 
+/**
+ * Response shape for the `/copilot_internal/user` endpoint.
+ * Used by per-session auth tests to mock GitHub identity resolution.
+ */
+export type CopilotUserResponse = {
+  login: string;
+  copilot_plan?: string;
+  token_based_billing?: boolean;
+  is_mcp_enabled?: boolean;
+  endpoints?: {
+    api?: string;
+    telemetry?: string;
+  };
+  analytics_tracking_id?: string;
+  quota_snapshots?: Record<
+    string,
+    {
+      entitlement?: number;
+      overage_count?: number;
+      overage_permitted?: boolean;
+      percent_remaining?: number;
+      timestamp_utc?: string;
+      unlimited?: boolean;
+    }
+  >;
+};
+
 export type ParsedHttpExchange = {
   request: ChatCompletionCreateParamsBase;
   response: ChatCompletion | undefined;
+  requestHeaders?: Record<string, string | string[] | undefined>;
 };
 
 // We want to be able to reuse the proxy across multiple tests, so it needs to be reconfigurable
@@ -938,6 +1794,7 @@ type ReplayingCapiProxyState = {
   filePath: string;
   workDir: string;
   testInfo?: { file: string; line?: number };
+  backend: ReplayBackend;
   storedData?: NormalizedData | undefined;
   toolResultNormalizers: ToolResultNormalizer[];
 };
@@ -963,8 +1820,18 @@ interface NormalizedConversation {
   messages: NormalizedMessage[];
 }
 
+interface NormalizedErrorResponse {
+  model?: string;
+  status: number;
+  code?: string;
+  message?: string;
+  retryAfterSeconds?: number;
+  messages: NormalizedMessage[];
+}
+
 export interface NormalizedData {
   models: string[];
+  errors?: NormalizedErrorResponse[];
   conversations: NormalizedConversation[];
 }
 

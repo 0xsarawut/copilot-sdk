@@ -1,6 +1,7 @@
 ---
 description: Triages newly opened issues by labeling, acknowledging, requesting clarification, and closing duplicates
 on:
+  roles: all
   issues:
     types: [opened]
   workflow_dispatch:
@@ -9,11 +10,11 @@ on:
         description: "Issue number to triage"
         required: true
         type: string
-roles: all
 permissions:
   contents: read
   issues: read
   pull-requests: read
+  copilot-requests: write
 tools:
   github:
     toolsets: [default]
@@ -21,19 +22,21 @@ safe-outputs:
   add-comment:
     max: 2
   add-labels:
-    allowed: [bug, enhancement, question, documentation, sdk/dotnet, sdk/go, sdk/nodejs, sdk/python, priority/high, priority/low, testing, security, needs-info, duplicate]
+    allowed: [bug, enhancement, question, documentation, sdk/dotnet, sdk/go, sdk/java, sdk/nodejs, sdk/python, priority/high, priority/low, testing, security, needs-info, duplicate]
     max: 10
     target: triggering
+    issue-intent: true
   update-issue:
     target: triggering
   close-issue:
     target: triggering
+    issue-intent: true
 timeout-minutes: 10
 ---
 
 # Issue Triage Agent
 
-You are an AI agent that triages newly opened issues in the copilot-sdk repository — a multi-language SDK with implementations in .NET, Go, Node.js, and Python.
+You are an AI agent that triages newly opened issues in the copilot-sdk repository — a multi-language SDK with implementations in .NET, Go, Java, Node.js, and Python.
 
 ## Your Task
 
@@ -48,7 +51,8 @@ When a new issue is opened, analyze it and perform the following actions:
 
 ### SDK/Language Labels (apply one or more if the issue relates to specific SDKs):
 - `sdk/dotnet` — .NET SDK issues
-- `sdk/go` — Go SDK issues  
+- `sdk/go` — Go SDK issues
+- `sdk/java` — Java SDK issues
 - `sdk/nodejs` — Node.js SDK issues
 - `sdk/python` — Python SDK issues
 

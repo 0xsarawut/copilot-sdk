@@ -2,6 +2,7 @@ package testharness
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,9 +17,11 @@ import (
 // CapiProxy manages a child process that acts as a replaying proxy to AI endpoints.
 // It spawns the shared test harness server from test/harness/server.ts.
 type CapiProxy struct {
-	cmd      *exec.Cmd
-	proxyURL string
-	mu       sync.Mutex
+	cmd             *exec.Cmd
+	proxyURL        string
+	connectProxyURL string
+	caFilePath      string
+	mu              sync.Mutex
 }
 
 // NewCapiProxy creates a new proxy instance.
@@ -35,11 +38,14 @@ func (p *CapiProxy) Start() (string, error) {
 		return p.proxyURL, nil
 	}
 
-	// The harness server is in the shared test directory
-	serverPath := "../../../test/harness/server.ts"
+	// The harness server is in the shared test directory. Anchor the path to
+	// the repo root (not the process cwd), because the in-process (FFI)
+	// transport os.Chdir's into a per-test temp workdir, which would otherwise
+	// break the cwd-relative resolution.
+	serverPath := RepoPath("test", "harness", "server.ts")
 
 	p.cmd = exec.Command("npx", "tsx", serverPath)
-	p.cmd.Dir = "." // Will be resolved relative to test execution
+	p.cmd.Dir = RepoPath("test", "harness")
 
 	stdout, err := p.cmd.StdoutPipe()
 	if err != nil {
@@ -53,23 +59,48 @@ func (p *CapiProxy) Start() (string, error) {
 		return "", fmt.Errorf("failed to start proxy server: %w", err)
 	}
 
-	// Read the first line to get the listening URL
+	// Read until the server prints "Listening: http://..."; npm/npx may emit
+	// wrapper output first on some platforms.
 	reader := bufio.NewReader(stdout)
-	line, err := reader.ReadString('\n')
-	if err != nil && err != io.EOF {
-		p.cmd.Process.Kill()
-		return "", fmt.Errorf("failed to read proxy URL: %w", err)
-	}
-
-	// Parse "Listening: http://..." from output
-	re := regexp.MustCompile(`Listening: (http://[^\s]+)`)
-	matches := re.FindStringSubmatch(strings.TrimSpace(line))
-	if len(matches) < 2 {
-		p.cmd.Process.Kill()
-		return "", fmt.Errorf("unexpected proxy output: %s", line)
+	re := regexp.MustCompile(`Listening: (http://[^\s]+)\s+(\{.*\})$`)
+	var matches []string
+	var line string
+	for {
+		nextLine, err := reader.ReadString('\n')
+		if err != nil && err != io.EOF {
+			p.cmd.Process.Kill()
+			return "", fmt.Errorf("failed to read proxy URL: %w", err)
+		}
+		line = strings.TrimSpace(nextLine)
+		matches = re.FindStringSubmatch(line)
+		if len(matches) >= 3 {
+			break
+		}
+		if strings.Contains(line, "Listening: ") {
+			p.cmd.Process.Kill()
+			return "", fmt.Errorf("proxy startup line missing CONNECT proxy metadata: %s", line)
+		}
+		if err == io.EOF {
+			p.cmd.Process.Kill()
+			return "", fmt.Errorf("proxy exited before startup; last output: %s", line)
+		}
 	}
 
 	p.proxyURL = matches[1]
+	var metadata struct {
+		ConnectProxyURL string `json:"connectProxyUrl"`
+		CAFilePath      string `json:"caFilePath"`
+	}
+	if err := json.Unmarshal([]byte(matches[2]), &metadata); err != nil {
+		p.cmd.Process.Kill()
+		return "", fmt.Errorf("failed to parse proxy startup metadata: %w", err)
+	}
+	p.connectProxyURL = metadata.ConnectProxyURL
+	p.caFilePath = metadata.CAFilePath
+	if p.connectProxyURL == "" || p.caFilePath == "" {
+		p.cmd.Process.Kill()
+		return "", fmt.Errorf("proxy startup metadata missing CONNECT proxy details: %s", line)
+	}
 	return p.proxyURL, nil
 }
 
@@ -157,10 +188,43 @@ func (p *CapiProxy) GetExchanges() ([]ParsedHttpExchange, error) {
 	return exchanges, nil
 }
 
+// GetRequests retrieves all captured outbound HTTP requests from the proxy.
+func (p *CapiProxy) GetRequests() ([]CapturedRequest, error) {
+	p.mu.Lock()
+	url := p.proxyURL
+	p.mu.Unlock()
+
+	if url == "" {
+		return nil, fmt.Errorf("proxy not started")
+	}
+
+	resp, err := http.Get(url + "/requests")
+	if err != nil {
+		return nil, fmt.Errorf("failed to get requests: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var requests []CapturedRequest
+	if err := json.NewDecoder(resp.Body).Decode(&requests); err != nil {
+		return nil, fmt.Errorf("failed to decode requests: %w", err)
+	}
+
+	return requests, nil
+}
+
+// CapturedRequest represents an outbound HTTP request captured by the proxy.
+type CapturedRequest struct {
+	Method  string                     `json:"method"`
+	URL     string                     `json:"url"`
+	Headers map[string]json.RawMessage `json:"headers"`
+	Body    string                     `json:"body"`
+}
+
 // ParsedHttpExchange represents a captured HTTP exchange.
 type ParsedHttpExchange struct {
-	Request  ChatCompletionRequest   `json:"request"`
-	Response *ChatCompletionResponse `json:"response,omitempty"`
+	Request        ChatCompletionRequest      `json:"request"`
+	Response       *ChatCompletionResponse    `json:"response,omitempty"`
+	RequestHeaders map[string]json.RawMessage `json:"requestHeaders,omitempty"`
 }
 
 // ChatCompletionRequest represents an OpenAI chat completion request.
@@ -172,10 +236,35 @@ type ChatCompletionRequest struct {
 
 // ChatCompletionMessage represents a message in the chat completion request.
 type ChatCompletionMessage struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	Role       string          `json:"role"`
+	Content    string          `json:"content,omitempty"`
+	RawContent json.RawMessage `json:"-"`
+	ToolCallID string          `json:"tool_call_id,omitempty"`
+	ToolCalls  []ToolCall      `json:"tool_calls,omitempty"`
+}
+
+// UnmarshalJSON handles Content being either a plain string or an array of
+// content parts (e.g. multimodal messages with image_url entries).
+func (m *ChatCompletionMessage) UnmarshalJSON(data []byte) error {
+	type Alias ChatCompletionMessage
+	aux := &struct {
+		Content json.RawMessage `json:"content,omitempty"`
+		*Alias
+	}{
+		Alias: (*Alias)(m),
+	}
+	if err := json.Unmarshal(data, aux); err != nil {
+		return err
+	}
+	m.RawContent = aux.Content
+	m.Content = ""
+	if len(aux.Content) > 0 {
+		var s string
+		if json.Unmarshal(aux.Content, &s) == nil {
+			m.Content = s
+		}
+	}
+	return nil
 }
 
 // ToolCall represents a tool call in an assistant message.
@@ -202,8 +291,9 @@ type ChatCompletionTool struct {
 
 // ChatCompletionToolFunction represents a function tool.
 type ChatCompletionToolFunction struct {
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
 }
 
 // ChatCompletionResponse represents an OpenAI chat completion response.
@@ -225,4 +315,61 @@ func (p *CapiProxy) URL() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.proxyURL
+}
+
+// ProxyEnv returns environment variables that route HTTPS traffic through the CONNECT proxy.
+func (p *CapiProxy) ProxyEnv() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.connectProxyURL == "" || p.caFilePath == "" {
+		return nil
+	}
+
+	noProxy := "127.0.0.1,localhost,::1"
+	return []string{
+		"HTTP_PROXY=" + p.connectProxyURL,
+		"HTTPS_PROXY=" + p.connectProxyURL,
+		"http_proxy=" + p.connectProxyURL,
+		"https_proxy=" + p.connectProxyURL,
+		"NO_PROXY=" + noProxy,
+		"no_proxy=" + noProxy,
+		"NODE_EXTRA_CA_CERTS=" + p.caFilePath,
+		"SSL_CERT_FILE=" + p.caFilePath,
+		"REQUESTS_CA_BUNDLE=" + p.caFilePath,
+		"CURL_CA_BUNDLE=" + p.caFilePath,
+		"GIT_SSL_CAINFO=" + p.caFilePath,
+		"GH_TOKEN=",
+		"GITHUB_TOKEN=",
+		"GH_ENTERPRISE_TOKEN=",
+		"GITHUB_ENTERPRISE_TOKEN=",
+	}
+}
+
+// SetCopilotUserByToken registers a per-token user configuration on the proxy.
+func (p *CapiProxy) SetCopilotUserByToken(token string, response map[string]interface{}) error {
+	p.mu.Lock()
+	url := p.proxyURL
+	p.mu.Unlock()
+
+	if url == "" {
+		return fmt.Errorf("proxy not started")
+	}
+
+	body := map[string]interface{}{
+		"token":    token,
+		"response": response,
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	resp, err := http.Post(url+"/copilot-user-config", "application/json", bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("setCopilotUserByToken: unexpected status %d", resp.StatusCode)
+	}
+	return nil
 }

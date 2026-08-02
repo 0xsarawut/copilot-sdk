@@ -7,27 +7,370 @@
  * @module session
  */
 
-import type { MessageConnection } from "vscode-jsonrpc/node";
+import type { MessageConnection } from "vscode-jsonrpc/node.js";
+import { ConnectionError, ErrorCodes, ResponseError } from "vscode-jsonrpc/node.js";
+import { createSessionRpc } from "./generated/rpc.js";
 import type {
+    ClientSessionApiHandlers,
+    CanvasActionInvokeResult,
+    CurrentToolMetadata,
+    McpOauthPendingRequestResponse,
+    FactoryLogLine,
+    FactoryRunRequest,
+    FactoryExecuteResult,
+    FactoryJournalPutRequest,
+    FactoryRunResult as WireFactoryRunResult,
+} from "./generated/rpc.js";
+import { type Canvas, CanvasError } from "./canvas.js";
+import type { OpenCanvasInstance } from "./generated/rpc.js";
+import { getTraceContext } from "./telemetry.js";
+import type {
+    CommandHandler,
+    AutoModeSwitchHandler,
+    AutoModeSwitchRequest,
+    AutoModeSwitchResponse,
+    ElicitationHandler,
+    ElicitationParams,
+    ElicitationResult,
+    ElicitationContext,
+    ExitPlanModeHandler,
+    ExitPlanModeRequest,
+    ExitPlanModeResult,
+    BearerTokenProvider,
+    UiInputOptions,
     MessageOptions,
+    McpAuthHandler,
+    McpAuthRequest,
     PermissionHandler,
     PermissionRequest,
-    PermissionRequestResult,
+    ContextTier,
+    ReasoningEffort,
+    ReasoningSummary,
+    ModelCapabilitiesOverride,
+    SectionTransformFn,
+    SessionCapabilities,
     SessionEvent,
     SessionEventHandler,
     SessionEventPayload,
     SessionEventType,
     SessionHooks,
+    SessionUiApi,
     Tool,
     ToolHandler,
+    ToolResult,
+    ToolResultObject,
+    TraceContextProvider,
     TypedSessionEventHandler,
     UserInputHandler,
     UserInputRequest,
     UserInputResponse,
 } from "./types.js";
+import {
+    getFactoryDefinition,
+    FactoryResumeError,
+    isFactoryRunTerminal,
+    type FactoryResumeErrorCode,
+    type FactoryRunResult,
+    type RunOptions,
+    type SessionFactoryApi,
+    type FactoryContext,
+    type FactoryHandle,
+    type JsonValue,
+    type FactoryStepOptions,
+} from "./factory.js";
+
+function isFactoryResumeErrorCode(value: unknown): value is FactoryResumeErrorCode {
+    return (
+        value === "not_found" ||
+        value === "non_resumable" ||
+        value === "already_active" ||
+        value === "reapproval_declined" ||
+        value === "no_approval_provider"
+    );
+}
+
+/**
+ * Convert a raw hook input received over the wire into its public-facing shape.
+ * This deserializes the numeric Unix-ms `timestamp` field on BaseHookInput
+ * into a Date and maps the wire `cwd` field to `workingDirectory`.
+ */
+function deserializeHookInput(raw: unknown): unknown {
+    if (
+        !raw ||
+        typeof raw !== "object" ||
+        typeof (raw as { timestamp?: unknown }).timestamp !== "number"
+    ) {
+        return raw;
+    }
+    const obj = raw as Record<string, unknown> & {
+        timestamp: number;
+        cwd?: string;
+        stop_hook_active?: boolean;
+    };
+    const { cwd, stop_hook_active, ...rest } = obj;
+    return {
+        ...rest,
+        timestamp: new Date(obj.timestamp),
+        workingDirectory: cwd,
+        ...(stop_hook_active === undefined ? {} : { stopHookActive: stop_hook_active }),
+    };
+}
+
+function isOpenCanvasInstance(value: unknown): value is OpenCanvasInstance {
+    if (!value || typeof value !== "object") {
+        return false;
+    }
+    const instance = value as Partial<OpenCanvasInstance>;
+    return (
+        typeof instance.instanceId === "string" &&
+        instance.instanceId.length > 0 &&
+        typeof instance.extensionId === "string" &&
+        instance.extensionId.length > 0 &&
+        typeof instance.canvasId === "string" &&
+        instance.canvasId.length > 0
+    );
+}
+
+const FACTORY_LOG_FLUSH_DELAY_MS = 10;
+const MAX_FACTORY_FANOUT_ITEMS = 4096;
+
+function assertFactoryFanoutSize(kind: "parallel" | "pipeline", size: number): void {
+    if (size > MAX_FACTORY_FANOUT_ITEMS) {
+        throw new Error(
+            `${kind}() accepts at most ${MAX_FACTORY_FANOUT_ITEMS} items; got ${size}.`
+        );
+    }
+}
+
+async function runFactoryParallel<TResult>(
+    thunks: Array<() => Promise<TResult> | TResult>
+): Promise<Array<TResult | null>> {
+    if (!Array.isArray(thunks)) {
+        throw new Error(
+            "parallel() expects an array of functions, not promises. Wrap each call: () => agent(...)"
+        );
+    }
+    assertFactoryFanoutSize("parallel", thunks.length);
+    if (thunks.some((thunk) => typeof thunk !== "function")) {
+        throw new Error(
+            "parallel() expects an array of functions, not promises. Wrap each call: () => agent(...)"
+        );
+    }
+    return Promise.all(
+        thunks.map((thunk) =>
+            Promise.resolve()
+                .then(() => thunk())
+                .catch((error) => {
+                    // Cancellation and hard runtime failures must propagate out
+                    // of the combinator rather than be mapped to a successful
+                    // `null`; otherwise an aborted run, or one that hit a
+                    // resource ceiling or durable-state failure, could be
+                    // reported as completed. An ordinary subagent failure never
+                    // rejects — it already resolves `null`.
+                    if (isFactoryFatalError(error)) {
+                        throw error;
+                    }
+                    return null;
+                })
+        )
+    );
+}
+
+async function runFactoryPipeline(
+    items: unknown[],
+    ...stages: Array<
+        (previous: unknown, item: unknown, index: number) => Promise<unknown> | unknown
+    >
+): Promise<unknown[]> {
+    if (!Array.isArray(items)) {
+        throw new Error("pipeline(items, ...stages): items must be an array");
+    }
+    assertFactoryFanoutSize("pipeline", items.length);
+    return Promise.all(
+        items.map(async (item, index) => {
+            let previous = item;
+            for (const stage of stages) {
+                try {
+                    previous = await stage(previous, item, index);
+                } catch (error) {
+                    // Propagate cancellation and hard runtime failures instead
+                    // of mapping them to `null`, so an aborted stage — or one
+                    // that hit a resource ceiling or durable-state failure —
+                    // does not let the run report success.
+                    if (isFactoryFatalError(error)) {
+                        throw error;
+                    }
+                    return null;
+                }
+            }
+            return previous;
+        })
+    );
+}
+
+class FactoryProgressBuffer {
+    private nextSeq = 0;
+    private pending: FactoryLogLine[] = [];
+    private flushTimer?: ReturnType<typeof setTimeout>;
+    private flushTail: Promise<void> = Promise.resolve();
+    private flushError: unknown;
+    private flushFailed = false;
+    private closed = false;
+
+    constructor(private readonly send: (lines: FactoryLogLine[]) => Promise<void>) {}
+
+    enqueue(kind: FactoryLogLine["kind"], text: string): void {
+        if (this.closed) {
+            throw new Error("Cannot log after the factory run has settled");
+        }
+
+        this.pending.push({ seq: this.nextSeq++, kind, text });
+        this.scheduleFlush();
+    }
+
+    async flush(): Promise<void> {
+        this.clearFlushTimer();
+        const lines = this.pending.splice(0);
+        if (lines.length > 0) {
+            this.flushTail = this.flushTail.then(async () => {
+                try {
+                    await this.send(lines);
+                } catch (error) {
+                    if (!this.flushFailed) {
+                        this.flushFailed = true;
+                        this.flushError = error;
+                    }
+                }
+            });
+        }
+        await this.flushTail;
+        if (this.flushFailed) {
+            throw this.flushError;
+        }
+    }
+
+    async close(): Promise<void> {
+        this.closed = true;
+        this.clearFlushTimer();
+        const lines = this.pending.splice(0);
+        await this.flushTail;
+        if (this.flushFailed) {
+            throw this.flushError;
+        }
+        if (lines.length > 0) {
+            try {
+                await this.send(lines);
+            } catch (error) {
+                console.warn(
+                    "Failed to flush final factory progress after the factory body settled",
+                    error
+                );
+            }
+        }
+    }
+
+    private scheduleFlush(): void {
+        if (this.flushTimer !== undefined) {
+            return;
+        }
+        this.flushTimer = setTimeout(() => {
+            this.flushTimer = undefined;
+            void this.flush().catch(() => {});
+        }, FACTORY_LOG_FLUSH_DELAY_MS);
+        this.flushTimer.unref?.();
+    }
+
+    private clearFlushTimer(): void {
+        if (this.flushTimer !== undefined) {
+            clearTimeout(this.flushTimer);
+            this.flushTimer = undefined;
+        }
+    }
+}
+
+/**
+ * Reconcile the generated envelope with the public one.
+ *
+ * The two are identical at runtime. They differ only in how `result` is typed:
+ * the runtime returns any JSON value, but the schema models the field as an
+ * opaque node, which the generator renders as an object. {@link FactoryRunResult}
+ * corrects that for the factory surface without changing `x-opaque-json`
+ * handling for any other consumer, so the boundary needs a cast rather than a
+ * conversion.
+ *
+ * Delete this along with the {@link FactoryRunResult} override once the schema
+ * distinguishes opaque JSON values from opaque in-process values —
+ * github/copilot-agent-runtime#14122.
+ */
+function toPublicFactoryRunResult(envelope: WireFactoryRunResult): FactoryRunResult {
+    return envelope as FactoryRunResult;
+}
+
+async function awaitFactoryOperation<TResult>(
+    operation: () => Promise<TResult>,
+    signal: AbortSignal
+): Promise<TResult> {
+    // The operation is a thunk so an already-aborted run never dispatches the
+    // RPC at all, rather than sending it and rejecting locally afterwards.
+    let rejectAbort: ((reason?: unknown) => void) | undefined;
+    const abortPromise = new Promise<never>((_resolve, reject) => {
+        rejectAbort = reject;
+    });
+    const onAbort = () =>
+        rejectAbort?.(signal.reason ?? new DOMException("Factory run was aborted", "AbortError"));
+    // Register before the abort check and before dispatching, so an abort can
+    // neither be missed by a not-yet-attached listener nor start work on an
+    // already-cancelled run.
+    signal.addEventListener("abort", onAbort, { once: true });
+    try {
+        throwIfFactoryAborted(signal);
+        return await Promise.race([operation(), abortPromise]);
+    } finally {
+        signal.removeEventListener("abort", onAbort);
+    }
+}
+
+function throwIfFactoryAborted(signal: AbortSignal): void {
+    if (signal.aborted) {
+        throw signal.reason ?? new DOMException("Factory run was aborted", "AbortError");
+    }
+}
+
+/**
+ * Whether an error represents factory run cancellation (an `AbortError`-shaped
+ * rejection from {@link awaitFactoryOperation}). Cancellation must bubble out of
+ * `parallel`/`pipeline` rather than being flattened into a `null` result.
+ */
+function isFactoryAbortError(error: unknown): boolean {
+    return (
+        typeof error === "object" &&
+        error !== null &&
+        "name" in error &&
+        (error as { name?: unknown }).name === "AbortError"
+    );
+}
+
+/**
+ * Errors a factory combinator must never swallow into a `null` item.
+ *
+ * Cooperative cancellation aborts the run, and a rejected RPC is a hard
+ * runtime failure — a reached limit, a durable-state failure, or a dropped
+ * transport — that must terminate the run rather than be reported as a
+ * successfully-`null` item. An ordinary subagent failure does not reject; the
+ * runtime already resolves it as `null`.
+ */
+function isFactoryFatalError(error: unknown): boolean {
+    return (
+        isFactoryAbortError(error) ||
+        error instanceof ResponseError ||
+        error instanceof ConnectionError
+    );
+}
 
 /** Assistant message event - the final response from the assistant. */
 export type AssistantMessageEvent = Extract<SessionEvent, { type: "assistant.message" }>;
+
+const TOOL_SEARCH_TOOL_NAME = "tool_search_tool";
 
 /**
  * Represents a single conversation session with the Copilot CLI.
@@ -51,17 +394,189 @@ export type AssistantMessageEvent = Extract<SessionEvent, { type: "assistant.mes
  * await session.sendAndWait({ prompt: "Hello, world!" });
  *
  * // Clean up
- * await session.destroy();
+ * await session.disconnect();
  * ```
  */
+/**
+ * Fixed name of the runtime's built-in tool-search tool. A client can replace
+ * its behavior by registering a {@link Tool} with this exact name and
+ * `overridesBuiltInTool: true`.
+ */
+
 export class CopilotSession {
     private eventHandlers: Set<SessionEventHandler> = new Set();
     private typedEventHandlers: Map<SessionEventType, Set<(event: SessionEvent) => void>> =
         new Map();
     private toolHandlers: Map<string, ToolHandler> = new Map();
+    private canvases: Map<string, Canvas> = new Map();
+    private bearerTokenProviders: Map<string, BearerTokenProvider> = new Map();
+    private commandHandlers: Map<string, CommandHandler> = new Map();
+    private factories = new Map<string, ReturnType<typeof getFactoryDefinition>>();
+    private factoryAbortControllers = new Map<string, Map<string, AbortController>>();
     private permissionHandler?: PermissionHandler;
+    private mcpAuthHandler?: McpAuthHandler;
     private userInputHandler?: UserInputHandler;
+    private elicitationHandler?: ElicitationHandler;
+    private exitPlanModeHandler?: ExitPlanModeHandler;
+    private autoModeSwitchHandler?: AutoModeSwitchHandler;
     private hooks?: SessionHooks;
+    private transformCallbacks?: Map<string, SectionTransformFn>;
+    private _rpc: ReturnType<typeof createSessionRpc> | null = null;
+    private traceContextProvider?: TraceContextProvider;
+    private readonly managedSettingsEnabled: boolean;
+    private _capabilities: SessionCapabilities = {};
+    private openCanvasInstances: OpenCanvasInstance[] = [];
+    private disconnected = false;
+
+    /** @internal Client session API handlers, populated by CopilotClient during create/resume. */
+    clientSessionApis: ClientSessionApiHandlers = {};
+
+    /**
+     * Friendly factory API for running registered factories by name or handle.
+     *
+     * @experimental Part of the experimental Agent Factories surface and may
+     * change or be removed in future SDK or CLI releases.
+     */
+    readonly factory: SessionFactoryApi = {
+        run: (async (
+            nameOrHandle: string | FactoryHandle,
+            options?: RunOptions
+        ): Promise<unknown> => {
+            const name =
+                typeof nameOrHandle === "string"
+                    ? nameOrHandle
+                    : getFactoryDefinition(nameOrHandle).meta.name;
+            if (options?.resumeFromRunId !== undefined) {
+                return this.factory.resume(options.resumeFromRunId, {
+                    limits: options.limits,
+                });
+            }
+            const envelope = await this.rpc.factory.run({
+                name,
+                args: (options?.args === undefined
+                    ? {}
+                    : options.args) as FactoryRunRequest["args"],
+                options: {
+                    limits: options?.limits,
+                },
+            });
+
+            return toPublicFactoryRunResult(envelope);
+        }) as SessionFactoryApi["run"],
+        resume: (async (runId: string, options?: Parameters<SessionFactoryApi["resume"]>[1]) => {
+            let response;
+            try {
+                response = await this.rpc.factory.resume({
+                    runId,
+                    limits: options?.limits,
+                });
+            } catch (error) {
+                if (
+                    error instanceof ResponseError &&
+                    typeof error.data === "object" &&
+                    error.data !== null
+                ) {
+                    const code = (error.data as { code?: unknown }).code;
+                    if (isFactoryResumeErrorCode(code)) {
+                        throw new FactoryResumeError(code, error.message);
+                    }
+                }
+                throw error;
+            }
+            return toPublicFactoryRunResult(response.run);
+        }) as SessionFactoryApi["resume"],
+        getRun: async (runId) => toPublicFactoryRunResult(await this.rpc.factory.getRun({ runId })),
+        waitForRun: (runId, options) => this.waitForFactoryRun(runId, options?.signal),
+        listRuns: async () => (await this.rpc.factory.listRuns()).runs,
+        getRunDetail: (runId) => this.rpc.factory.getRunDetail({ runId }),
+        getRunProgress: (runId, options = {}) =>
+            this.rpc.factory.getRunProgress({ runId, ...options }),
+        cancel: async (runId) => toPublicFactoryRunResult(await this.rpc.factory.cancel({ runId })),
+    };
+
+    /**
+     * Resolve when a factory run reaches a terminal status.
+     *
+     * The subscription is installed *before* the first read so a transition
+     * landing between the two cannot be missed, and re-reads are serialized so
+     * overlapping invalidation events cannot interleave — the run's revision
+     * advances once per operation, so a burst of events is common and must
+     * collapse into a single in-flight read. A bounded periodic re-read keeps a
+     * dropped invalidation from leaving the wait pending forever.
+     */
+    private waitForFactoryRun(runId: string, signal?: AbortSignal): Promise<FactoryRunResult> {
+        const abortError = (): unknown =>
+            signal?.reason ?? new DOMException("Factory run wait was aborted", "AbortError");
+        if (signal?.aborted === true) {
+            return Promise.reject(abortError());
+        }
+
+        return new Promise<FactoryRunResult>((resolve, reject) => {
+            let settled = false;
+            let reading = false;
+            let rereadRequested = false;
+            let pollHandle: ReturnType<typeof setInterval> | undefined;
+            let unsubscribe: (() => void) | undefined;
+            let onAbort: (() => void) | undefined;
+
+            const finish = (complete: () => void): void => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                if (pollHandle !== undefined) {
+                    clearInterval(pollHandle);
+                }
+                unsubscribe?.();
+                if (onAbort !== undefined) {
+                    signal?.removeEventListener("abort", onAbort);
+                }
+                complete();
+            };
+
+            const read = async (): Promise<void> => {
+                if (settled) {
+                    return;
+                }
+                if (reading) {
+                    rereadRequested = true;
+                    return;
+                }
+                reading = true;
+                try {
+                    do {
+                        rereadRequested = false;
+                        const envelope = await this.rpc.factory.getRun({ runId });
+                        if (isFactoryRunTerminal(envelope.status)) {
+                            finish(() => resolve(toPublicFactoryRunResult(envelope)));
+                            return;
+                        }
+                    } while (rereadRequested && !settled);
+                } catch (error) {
+                    finish(() => reject(error));
+                } finally {
+                    reading = false;
+                }
+            };
+
+            if (signal !== undefined) {
+                onAbort = (): void => finish(() => reject(abortError()));
+                signal.addEventListener("abort", onAbort, { once: true });
+            }
+
+            unsubscribe = this.on("factory.run_updated", (event) => {
+                if (event.data.runId === runId) {
+                    void read();
+                }
+            });
+
+            pollHandle = setInterval(() => void read(), 5_000);
+            // The re-read is a safety net, not work the process owes anyone: an
+            // outstanding wait must never keep Node alive on its own.
+            pollHandle.unref?.();
+            void read();
+        });
+    }
 
     /**
      * Creates a new CopilotSession instance.
@@ -69,13 +584,30 @@ export class CopilotSession {
      * @param sessionId - The unique identifier for this session
      * @param connection - The JSON-RPC message connection to the Copilot CLI
      * @param workspacePath - Path to the session workspace directory (when infinite sessions enabled)
+     * @param traceContextProvider - Optional callback to get W3C Trace Context for outbound RPCs
      * @internal This constructor is internal. Use {@link CopilotClient.createSession} to create sessions.
      */
     constructor(
         public readonly sessionId: string,
         private connection: MessageConnection,
-        private readonly _workspacePath?: string
-    ) {}
+        private _workspacePath?: string,
+        traceContextProvider?: TraceContextProvider,
+        options?: { mcpAuthHandler?: McpAuthHandler; managedSettingsEnabled?: boolean }
+    ) {
+        this.traceContextProvider = traceContextProvider;
+        this.mcpAuthHandler = options?.mcpAuthHandler;
+        this.managedSettingsEnabled = options?.managedSettingsEnabled === true;
+    }
+
+    /**
+     * Typed session-scoped RPC methods.
+     */
+    get rpc(): ReturnType<typeof createSessionRpc> {
+        if (!this._rpc) {
+            this._rpc = createSessionRpc(this.connection, this.sessionId);
+        }
+        return this._rpc;
+    }
 
     /**
      * Path to the session workspace directory when infinite sessions are enabled.
@@ -87,6 +619,35 @@ export class CopilotSession {
     }
 
     /**
+     * Host capabilities reported when the session was created or resumed.
+     * Use this to check feature support before calling capability-gated APIs.
+     */
+    get capabilities(): SessionCapabilities {
+        return this._capabilities;
+    }
+
+    /**
+     * Interactive UI methods for showing dialogs to the user.
+     * Only available when the CLI host supports elicitation
+     * (`session.capabilities.ui?.elicitation === true`).
+     *
+     * @example
+     * ```typescript
+     * if (session.capabilities.ui?.elicitation) {
+     *   const ok = await session.ui.confirm("Deploy to production?");
+     * }
+     * ```
+     */
+    get ui(): SessionUiApi {
+        return {
+            elicitation: (params: ElicitationParams) => this._elicitation(params),
+            confirm: (message: string) => this._confirm(message),
+            select: (message: string, options: string[]) => this._select(message, options),
+            input: (message: string, options?: UiInputOptions) => this._input(message, options),
+        };
+    }
+
+    /**
      * Sends a message to this session and waits for the response.
      *
      * The message is processed asynchronously. Subscribe to events via {@link on}
@@ -94,7 +655,7 @@ export class CopilotSession {
      *
      * @param options - The message options including the prompt and optional attachments
      * @returns A promise that resolves with the message ID of the response
-     * @throws Error if the session has been destroyed or the connection fails
+     * @throws Error if the session has been disconnected or the connection fails
      *
      * @example
      * ```typescript
@@ -104,12 +665,20 @@ export class CopilotSession {
      * });
      * ```
      */
-    async send(options: MessageOptions): Promise<string> {
+    async send(prompt: string): Promise<string>;
+    async send(options: MessageOptions): Promise<string>;
+    async send(optionsOrPrompt: MessageOptions | string): Promise<string> {
+        const options: MessageOptions =
+            typeof optionsOrPrompt === "string" ? { prompt: optionsOrPrompt } : optionsOrPrompt;
         const response = await this.connection.sendRequest("session.send", {
+            ...(await getTraceContext(this.traceContextProvider)),
             sessionId: this.sessionId,
             prompt: options.prompt,
+            displayPrompt: options.displayPrompt,
             attachments: options.attachments,
             mode: options.mode,
+            agentMode: options.agentMode,
+            requestHeaders: options.requestHeaders,
         });
 
         return (response as { messageId: string }).messageId;
@@ -129,7 +698,7 @@ export class CopilotSession {
      * @returns A promise that resolves with the final assistant message when the session becomes idle,
      *          or undefined if no assistant message was received
      * @throws Error if the timeout is reached before the session becomes idle
-     * @throws Error if the session has been destroyed or the connection fails
+     * @throws Error if the session has been disconnected or the connection fails
      *
      * @example
      * ```typescript
@@ -138,10 +707,17 @@ export class CopilotSession {
      * console.log(response?.data.content); // "4"
      * ```
      */
+    async sendAndWait(prompt: string, timeout?: number): Promise<AssistantMessageEvent | undefined>;
     async sendAndWait(
         options: MessageOptions,
         timeout?: number
+    ): Promise<AssistantMessageEvent | undefined>;
+    async sendAndWait(
+        optionsOrPrompt: MessageOptions | string,
+        timeout?: number
     ): Promise<AssistantMessageEvent | undefined> {
+        const options: MessageOptions =
+            typeof optionsOrPrompt === "string" ? { prompt: optionsOrPrompt } : optionsOrPrompt;
         const effectiveTimeout = timeout ?? 60_000;
 
         let resolveIdle: () => void;
@@ -167,11 +743,12 @@ export class CopilotSession {
             }
         });
 
+        let timeoutId: ReturnType<typeof setTimeout> | undefined;
         try {
             await this.send(options);
 
             const timeoutPromise = new Promise<never>((_, reject) => {
-                setTimeout(
+                timeoutId = setTimeout(
                     () =>
                         reject(
                             new Error(
@@ -185,8 +762,34 @@ export class CopilotSession {
 
             return lastAssistantMessage;
         } finally {
+            if (timeoutId !== undefined) {
+                clearTimeout(timeoutId);
+            }
             unsubscribe();
         }
+    }
+
+    /** @internal */
+    _markDisconnected(): void {
+        this.disconnected = true;
+        this.eventHandlers.clear();
+        this.typedEventHandlers.clear();
+        this.toolHandlers.clear();
+        this.permissionHandler = undefined;
+        this.userInputHandler = undefined;
+        this.elicitationHandler = undefined;
+        this.exitPlanModeHandler = undefined;
+        this.autoModeSwitchHandler = undefined;
+        this.commandHandlers.clear();
+        this.canvases.clear();
+        this.factories.clear();
+        for (const controllersForRun of this.factoryAbortControllers.values()) {
+            for (const controller of controllersForRun.values()) {
+                controller.abort();
+            }
+        }
+        this.factoryAbortControllers.clear();
+        this.transformCallbacks?.clear();
     }
 
     /**
@@ -268,11 +871,15 @@ export class CopilotSession {
 
     /**
      * Dispatches an event to all registered handlers.
+     * Also handles broadcast request events internally (external tool calls, permissions).
      *
      * @param event - The session event to dispatch
      * @internal This method is for internal use by the SDK.
      */
     _dispatchEvent(event: SessionEvent): void {
+        // Handle broadcast request events internally (fire-and-forget)
+        this._handleBroadcastEvent(event);
+
         // Dispatch to typed handlers for this specific event type
         const typedHandlers = this.typedEventHandlers.get(event.type);
         if (typedHandlers) {
@@ -296,10 +903,327 @@ export class CopilotSession {
     }
 
     /**
+     * Handles broadcast request events by executing local handlers and responding via RPC.
+     * Handlers are dispatched as fire-and-forget — rejections propagate as unhandled promise
+     * rejections, consistent with standard EventEmitter / event handler semantics.
+     * @internal
+     */
+    private _handleBroadcastEvent(event: SessionEvent): void {
+        if (this.disconnected) {
+            return;
+        }
+        if (event.type === "external_tool.requested") {
+            const { requestId, toolName } = event.data as {
+                requestId: string;
+                toolName: string;
+                arguments: unknown;
+                toolCallId: string;
+                sessionId: string;
+            };
+            const args = (event.data as { arguments: unknown }).arguments;
+            const toolCallId = (event.data as { toolCallId: string }).toolCallId;
+            const traceparent = (event.data as { traceparent?: string }).traceparent;
+            const tracestate = (event.data as { tracestate?: string }).tracestate;
+            const handler = this.toolHandlers.get(toolName);
+            if (handler) {
+                void this._executeToolAndRespond(
+                    requestId,
+                    toolName,
+                    toolCallId,
+                    args,
+                    handler,
+                    traceparent,
+                    tracestate
+                );
+            }
+        } else if (event.type === "permission.requested") {
+            const { requestId, permissionRequest, resolvedByHook } = event.data as {
+                requestId: string;
+                permissionRequest: PermissionRequest;
+                resolvedByHook?: boolean;
+            };
+            if (resolvedByHook) {
+                return; // Already resolved by a permissionRequest hook; no client action needed.
+            }
+            if (this.permissionHandler) {
+                void this._executePermissionAndRespond(requestId, permissionRequest);
+            }
+        } else if (event.type === "mcp.oauth_required") {
+            const data = event.data as McpAuthRequest | undefined;
+            if (!data?.requestId) {
+                return;
+            }
+            if (!this.mcpAuthHandler) {
+                console.warn(
+                    "Received MCP OAuth request without a registered MCP auth handler. " +
+                        `SessionId=${this.sessionId}, RequestId=${data.requestId}`
+                );
+                return;
+            }
+            void this._executeMcpAuthAndRespond(data);
+        } else if (event.type === "command.execute") {
+            const { requestId, commandName, command, args } = event.data as {
+                requestId: string;
+                command: string;
+                commandName: string;
+                args: string;
+            };
+            void this._executeCommandAndRespond(requestId, commandName, command, args);
+        } else if (event.type === "elicitation.requested") {
+            if (this.elicitationHandler) {
+                const { message, requestedSchema, mode, elicitationSource, url, requestId } =
+                    event.data;
+                void this._handleElicitationRequest(
+                    {
+                        sessionId: this.sessionId,
+                        message,
+                        requestedSchema: requestedSchema as ElicitationContext["requestedSchema"],
+                        mode,
+                        elicitationSource,
+                        url,
+                    },
+                    requestId
+                );
+            }
+        } else if (event.type === "capabilities.changed") {
+            this._capabilities = { ...this._capabilities, ...event.data };
+        } else if (event.type === "session.canvas.opened") {
+            this.upsertOpenCanvasFromEvent(event.data);
+        } else if (event.type === "session.canvas.closed") {
+            this.removeOpenCanvasFromEvent(event.data);
+        }
+    }
+
+    private upsertOpenCanvasFromEvent(data: unknown): void {
+        if (!isOpenCanvasInstance(data)) {
+            console.warn("failed to deserialize session.canvas.opened payload");
+            return;
+        }
+        this.upsertOpenCanvas(data);
+    }
+
+    private removeOpenCanvasFromEvent(data: unknown): void {
+        if (
+            !data ||
+            typeof data !== "object" ||
+            typeof (data as { instanceId?: unknown }).instanceId !== "string" ||
+            (data as { instanceId: string }).instanceId.length === 0
+        ) {
+            console.warn("failed to deserialize session.canvas.closed payload");
+            return;
+        }
+        this.removeOpenCanvas((data as { instanceId: string }).instanceId);
+    }
+
+    private removeOpenCanvas(instanceId: string): void {
+        this.openCanvasInstances = this.openCanvasInstances.filter(
+            (open) => open.instanceId !== instanceId
+        );
+    }
+
+    private upsertOpenCanvas(instance: OpenCanvasInstance): void {
+        const index = this.openCanvasInstances.findIndex(
+            (open) => open.instanceId === instance.instanceId
+        );
+        if (index >= 0) {
+            this.openCanvasInstances[index] = instance;
+        } else {
+            this.openCanvasInstances.push(instance);
+        }
+    }
+
+    /**
+     * Executes a tool handler and sends the result back via RPC.
+     * @internal
+     */
+    private async _executeToolAndRespond(
+        requestId: string,
+        toolName: string,
+        toolCallId: string,
+        args: unknown,
+        handler: ToolHandler,
+        traceparent?: string,
+        tracestate?: string
+    ): Promise<void> {
+        try {
+            // The built-in tool-search tool receives a snapshot of the session's
+            // currently initialized tools so an override can filter the live
+            // catalog without issuing its own RPC. Fetch it only for that tool
+            // to avoid a round-trip on every tool call; a failed fetch simply
+            // leaves the snapshot undefined rather than failing the tool.
+            let availableTools: CurrentToolMetadata[] | undefined;
+            if (toolName === TOOL_SEARCH_TOOL_NAME) {
+                try {
+                    const metadata = await this.rpc.tools.getCurrentMetadata();
+                    availableTools = metadata.tools ?? undefined;
+                } catch {
+                    availableTools = undefined;
+                }
+            }
+            const rawResult = await handler(args, {
+                sessionId: this.sessionId,
+                toolCallId,
+                toolName,
+                arguments: args,
+                availableTools,
+                traceparent,
+                tracestate,
+            });
+            let result: ToolResult;
+            if (rawResult == null) {
+                result = "";
+            } else if (typeof rawResult === "string") {
+                result = rawResult;
+            } else if (isToolResultObject(rawResult)) {
+                result = rawResult;
+            } else {
+                result = JSON.stringify(rawResult);
+            }
+            if (this.disconnected) {
+                return;
+            }
+            await this.rpc.tools.handlePendingToolCall({ requestId, result });
+        } catch (error) {
+            if (this.disconnected) {
+                return;
+            }
+            const message = error instanceof Error ? error.message : String(error);
+            try {
+                await this.rpc.tools.handlePendingToolCall({ requestId, error: message });
+            } catch (rpcError) {
+                if (!(rpcError instanceof ConnectionError || rpcError instanceof ResponseError)) {
+                    throw rpcError;
+                }
+                // Connection lost or RPC error — nothing we can do
+            }
+        }
+    }
+
+    /**
+     * Executes a permission handler and sends the result back via RPC.
+     * @internal
+     */
+    private async _executePermissionAndRespond(
+        requestId: string,
+        permissionRequest: PermissionRequest
+    ): Promise<void> {
+        try {
+            const result = await this.permissionHandler!(permissionRequest, {
+                sessionId: this.sessionId,
+                managedSettingsEnabled: this.managedSettingsEnabled,
+            });
+            if (result.kind === "no-result") {
+                return;
+            }
+            if (this.disconnected) {
+                return;
+            }
+            await this.rpc.permissions.handlePendingPermissionRequest({ requestId, result });
+        } catch (error) {
+            if (this.disconnected) {
+                return;
+            }
+            console.error("Permission handler or response delivery failed", {
+                sessionId: this.sessionId,
+                requestId,
+                error,
+            });
+            try {
+                await this.rpc.permissions.handlePendingPermissionRequest({
+                    requestId,
+                    result: {
+                        kind: "user-not-available",
+                    },
+                });
+            } catch (rpcError) {
+                if (!(rpcError instanceof ConnectionError || rpcError instanceof ResponseError)) {
+                    throw rpcError;
+                }
+                // Connection lost or RPC error — nothing we can do
+            }
+        }
+    }
+
+    /**
+     * Executes an MCP auth handler and sends the result back via RPC.
+     * @internal
+     */
+    private async _executeMcpAuthAndRespond(request: McpAuthRequest): Promise<void> {
+        try {
+            const result = await this.mcpAuthHandler!(request, { sessionId: this.sessionId });
+            const response: McpOauthPendingRequestResponse =
+                result && "accessToken" in result
+                    ? { kind: "token", ...result }
+                    : { kind: "cancelled" };
+            await this.rpc.mcp.oauth.handlePendingRequest({
+                requestId: request.requestId,
+                result: response,
+            });
+        } catch (_error) {
+            try {
+                await this.rpc.mcp.oauth.handlePendingRequest({
+                    requestId: request.requestId,
+                    result: { kind: "cancelled" },
+                });
+            } catch (rpcError) {
+                if (!(rpcError instanceof ConnectionError || rpcError instanceof ResponseError)) {
+                    throw rpcError;
+                }
+            }
+        }
+    }
+
+    /**
+     * Executes a command handler and sends the result back via RPC.
+     * @internal
+     */
+    private async _executeCommandAndRespond(
+        requestId: string,
+        commandName: string,
+        command: string,
+        args: string
+    ): Promise<void> {
+        const handler = this.commandHandlers.get(commandName);
+        if (!handler) {
+            try {
+                await this.rpc.commands.handlePendingCommand({
+                    requestId,
+                    error: `Unknown command: ${commandName}`,
+                });
+            } catch (rpcError) {
+                if (!(rpcError instanceof ConnectionError || rpcError instanceof ResponseError)) {
+                    throw rpcError;
+                }
+            }
+            return;
+        }
+
+        try {
+            await handler({ sessionId: this.sessionId, command, commandName, args });
+            if (this.disconnected) {
+                return;
+            }
+            await this.rpc.commands.handlePendingCommand({ requestId });
+        } catch (error) {
+            if (this.disconnected) {
+                return;
+            }
+            const message = error instanceof Error ? error.message : String(error);
+            try {
+                await this.rpc.commands.handlePendingCommand({ requestId, error: message });
+            } catch (rpcError) {
+                if (!(rpcError instanceof ConnectionError || rpcError instanceof ResponseError)) {
+                    throw rpcError;
+                }
+            }
+        }
+    }
+
+    /**
      * Registers custom tool handlers for this session.
      *
-     * Tools allow the assistant to execute custom functions. When the assistant
-     * invokes a tool, the corresponding handler is called with the tool arguments.
+     * Tools with handlers allow the assistant to execute custom functions automatically.
+     * Declaration-only tools are surfaced as events and left pending for the consumer.
      *
      * @param tools - An array of tool definitions with their handlers, or undefined to clear all tools
      * @internal This method is typically called internally when creating a session with tools.
@@ -311,7 +1235,9 @@ export class CopilotSession {
         }
 
         for (const tool of tools) {
-            this.toolHandlers.set(tool.name, tool.handler);
+            if (tool.handler) {
+                this.toolHandlers.set(tool.name, tool.handler);
+            }
         }
     }
 
@@ -324,6 +1250,482 @@ export class CopilotSession {
      */
     getToolHandler(name: string): ToolHandler | undefined {
         return this.toolHandlers.get(name);
+    }
+
+    /**
+     * Registers canvas declarations and handlers for this session.
+     *
+     * @param canvases - Canvases created via `createCanvas`, or undefined to clear all canvases
+     * @internal Called by the SDK when creating/resuming a session with `canvases`.
+     */
+    registerCanvases(canvases?: Canvas[]): void {
+        this.canvases.clear();
+        if (!canvases || canvases.length === 0) {
+            delete this.clientSessionApis.canvas;
+            return;
+        }
+        for (const canvas of canvases) {
+            this.canvases.set(canvas.declaration.id, canvas);
+        }
+
+        const self = this;
+        this.clientSessionApis.canvas = {
+            async open(params) {
+                const canvas = self.canvases.get(params.canvasId);
+                if (!canvas) throw new Error(`No canvas registered with id "${params.canvasId}"`);
+                try {
+                    return (await canvas.open(params)) ?? {};
+                } catch (error) {
+                    throw toCanvasRpcError(error);
+                }
+            },
+            async close(params) {
+                const canvas = self.canvases.get(params.canvasId);
+                if (!canvas) throw new Error(`No canvas registered with id "${params.canvasId}"`);
+                try {
+                    if (canvas.onClose) {
+                        await canvas.onClose(params);
+                    }
+                } catch (error) {
+                    throw toCanvasRpcError(error);
+                }
+            },
+            async invoke(params) {
+                const canvas = self.canvases.get(params.canvasId);
+                if (!canvas) throw new Error(`No canvas registered with id "${params.canvasId}"`);
+                const handler = canvas.actionHandlers.get(params.actionName);
+                if (!handler) {
+                    throw new CanvasError(
+                        "canvas_action_no_handler",
+                        "No handler implemented for this canvas action"
+                    );
+                }
+                try {
+                    return (await handler(params)) as CanvasActionInvokeResult;
+                } catch (error) {
+                    throw toCanvasRpcError(error);
+                }
+            },
+        };
+    }
+
+    /**
+     * Registers factory closures and reverse-RPC handlers for this session.
+     *
+     * @param factories - Factory handles declared by the joining extension.
+     * @internal Called by the SDK when an extension joins a session.
+     */
+    registerFactories(factories?: FactoryHandle[]): void {
+        this.factories.clear();
+        if (!factories || factories.length === 0) {
+            delete this.clientSessionApis.factory;
+            return;
+        }
+
+        for (const handle of factories) {
+            const definition = getFactoryDefinition(handle);
+            if (this.factories.has(definition.meta.name)) {
+                throw new Error(
+                    `Duplicate factory name "${definition.meta.name}". Factory names must be unique within a joinSession call.`
+                );
+            }
+            this.factories.set(definition.meta.name, definition);
+        }
+
+        const self = this;
+        this.clientSessionApis.factory = {
+            async execute(params) {
+                const definition = self.factories.get(params.name);
+                if (!definition) {
+                    const message = `No factory registered with name "${params.name}"`;
+                    throw new ResponseError(ErrorCodes.InvalidParams, message, {
+                        code: "factory_not_found",
+                        name: params.name,
+                    });
+                }
+
+                const controller = new AbortController();
+                // Keyed by execution token as well as run ID so overlapping
+                // attempts for one run stay individually addressable.
+                let controllersForRun = self.factoryAbortControllers.get(params.runId);
+                if (controllersForRun === undefined) {
+                    controllersForRun = new Map();
+                    self.factoryAbortControllers.set(params.runId, controllersForRun);
+                }
+                controllersForRun.set(params.executionToken, controller);
+                const progress = new FactoryProgressBuffer(async (lines) => {
+                    await self.rpc.factory.log({
+                        runId: params.runId,
+                        executionToken: params.executionToken,
+                        lines,
+                    });
+                });
+                try {
+                    const context: FactoryContext = {
+                        runId: params.runId,
+                        args: params.args as JsonValue,
+                        session: self,
+                        signal: controller.signal,
+                        phase: (title: string) => {
+                            throwIfFactoryAborted(controller.signal);
+                            progress.enqueue("phase", title);
+                        },
+                        log: (message: string) => {
+                            throwIfFactoryAborted(controller.signal);
+                            progress.enqueue("log", message);
+                        },
+                        agent: async (prompt, options = {}) => {
+                            await progress.flush();
+                            const response = await awaitFactoryOperation(
+                                () =>
+                                    self.rpc.factory.agent({
+                                        factoryRunId: params.runId,
+                                        executionToken: params.executionToken,
+                                        prompt,
+                                        opts: {
+                                            label: options.label,
+                                            schema: options.schema,
+                                            model: options.model,
+                                        },
+                                    }),
+                                controller.signal
+                            );
+                            return response.result ?? null;
+                        },
+                        step: async (
+                            key: string,
+                            producer: () => Promise<JsonValue> | JsonValue,
+                            options: FactoryStepOptions = {}
+                        ): Promise<JsonValue> => {
+                            await progress.flush();
+                            if (options.volatile) {
+                                // The flush above is an await point, so an abort can land
+                                // between entering step() and running the producer. The
+                                // journaled branch is covered by awaitFactoryOperation;
+                                // this one has to check for itself, or a cancelled run
+                                // would still start new extension work.
+                                throwIfFactoryAborted(controller.signal);
+                                return producer();
+                            }
+                            const cached = await awaitFactoryOperation(
+                                () =>
+                                    self.rpc.factory.journal.get({
+                                        runId: params.runId,
+                                        executionToken: params.executionToken,
+                                        key,
+                                    }),
+                                controller.signal
+                            );
+                            if (cached.hit) {
+                                if (cached.resultJson === undefined) {
+                                    throw new Error(
+                                        `step("${key}") journal returned a hit without a result`
+                                    );
+                                }
+                                assertFactoryStepResult(cached.resultJson, key);
+                                return cached.resultJson;
+                            }
+
+                            // Producers are best-effort at-least-once across crashes or
+                            // concurrent callers, so authors must make side effects idempotent.
+                            const result = await producer();
+                            assertFactoryStepResult(result, key);
+                            await awaitFactoryOperation(
+                                () =>
+                                    self.rpc.factory.journal.put({
+                                        runId: params.runId,
+                                        executionToken: params.executionToken,
+                                        key,
+                                        resultJson:
+                                            result as FactoryJournalPutRequest["resultJson"],
+                                    }),
+                                controller.signal
+                            );
+                            return result;
+                        },
+                        parallel: runFactoryParallel,
+                        pipeline: runFactoryPipeline,
+                        factory: async () => {
+                            throw new Error("nested factories are not supported");
+                        },
+                    };
+                    const result = await definition.run(context);
+                    if (result === undefined) {
+                        return {};
+                    }
+                    assertFactoryResult(result);
+                    return { result } as FactoryExecuteResult;
+                } finally {
+                    try {
+                        await progress.close();
+                    } finally {
+                        const controllersForRun = self.factoryAbortControllers.get(params.runId);
+                        if (controllersForRun?.get(params.executionToken) === controller) {
+                            controllersForRun.delete(params.executionToken);
+                            if (controllersForRun.size === 0) {
+                                self.factoryAbortControllers.delete(params.runId);
+                            }
+                        }
+                    }
+                }
+            },
+            async abort(params) {
+                const controllersForRun = self.factoryAbortControllers.get(params.runId);
+                if (controllersForRun !== undefined) {
+                    const reason = new DOMException("Factory run was aborted", "AbortError");
+                    for (const controller of controllersForRun.values()) {
+                        controller.abort(reason);
+                    }
+                }
+                return {};
+            },
+        };
+    }
+
+    /**
+     * Registers per-provider {@link BearerTokenProvider} callbacks for BYOK providers
+     * configured with managed-identity / on-demand bearer-token auth.
+     *
+     * The runtime never receives the callback itself; the SDK strips it from the
+     * provider config and instead sends `hasBearerTokenProvider: true`. When the
+     * runtime needs a token it issues a session-scoped `providerToken.getToken`
+     * request, which this handler routes to the matching per-provider callback.
+     *
+     * @param providers - Map of provider name → callback, or undefined/empty to clear.
+     * @internal This method is called internally when creating/resuming a session.
+     */
+    registerBearerTokenProviders(providers?: Map<string, BearerTokenProvider>): void {
+        this.bearerTokenProviders.clear();
+        if (!providers || providers.size === 0) {
+            delete this.clientSessionApis.providerToken;
+            return;
+        }
+        for (const [name, callback] of providers) {
+            this.bearerTokenProviders.set(name, callback);
+        }
+
+        const self = this;
+        this.clientSessionApis.providerToken = {
+            async getToken(params) {
+                const callback = self.bearerTokenProviders.get(params.providerName);
+                if (!callback) {
+                    throw new Error(
+                        `No bearer-token provider registered for provider "${params.providerName}"`
+                    );
+                }
+                const token = await callback({
+                    providerName: params.providerName,
+                    sessionId: params.sessionId,
+                });
+                return { token };
+            },
+        };
+    }
+
+    /**
+     * Registers command handlers for this session.
+     *
+     * @param commands - An array of command definitions with handlers, or undefined to clear
+     * @internal This method is typically called internally when creating/resuming a session.
+     */
+    registerCommands(commands?: { name: string; handler: CommandHandler }[]): void {
+        this.commandHandlers.clear();
+        if (!commands) {
+            return;
+        }
+        for (const cmd of commands) {
+            this.commandHandlers.set(cmd.name, cmd.handler);
+        }
+    }
+
+    /**
+     * Registers the elicitation handler for this session.
+     *
+     * @param handler - The handler to invoke when the server dispatches an elicitation request
+     * @internal This method is typically called internally when creating/resuming a session.
+     */
+    registerElicitationHandler(handler?: ElicitationHandler): void {
+        this.elicitationHandler = handler;
+    }
+
+    /**
+     * Registers the exit-plan-mode handler for this session.
+     *
+     * @param handler - The handler to invoke when the server dispatches an exit-plan-mode request
+     * @internal This method is typically called internally when creating/resuming a session.
+     */
+    registerExitPlanModeHandler(handler?: ExitPlanModeHandler): void {
+        this.exitPlanModeHandler = handler;
+    }
+
+    /**
+     * Registers the auto-mode-switch handler for this session.
+     *
+     * @param handler - The handler to invoke when the server dispatches an auto-mode-switch request
+     * @internal This method is typically called internally when creating/resuming a session.
+     */
+    registerAutoModeSwitchHandler(handler?: AutoModeSwitchHandler): void {
+        this.autoModeSwitchHandler = handler;
+    }
+
+    /**
+     * Handles an elicitation.requested broadcast event.
+     * Invokes the registered handler and responds via handlePendingElicitation RPC.
+     * @internal
+     */
+    async _handleElicitationRequest(context: ElicitationContext, requestId: string): Promise<void> {
+        if (!this.elicitationHandler) {
+            return;
+        }
+        try {
+            const result = await this.elicitationHandler(context);
+            await this.rpc.ui.handlePendingElicitation({ requestId, result });
+        } catch {
+            // Handler failed — attempt to cancel so the request doesn't hang
+            try {
+                await this.rpc.ui.handlePendingElicitation({
+                    requestId,
+                    result: { action: "cancel" },
+                });
+            } catch (rpcError) {
+                if (!(rpcError instanceof ConnectionError || rpcError instanceof ResponseError)) {
+                    throw rpcError;
+                }
+                // Connection lost or RPC error — nothing we can do
+            }
+        }
+    }
+
+    /**
+     * Handles an exitPlanMode.request callback from the runtime.
+     * @internal
+     */
+    async _handleExitPlanModeRequest(request: ExitPlanModeRequest): Promise<ExitPlanModeResult> {
+        if (!this.exitPlanModeHandler) {
+            return { approved: true };
+        }
+
+        return await this.exitPlanModeHandler(request, { sessionId: this.sessionId });
+    }
+
+    /**
+     * Handles an autoModeSwitch.request callback from the runtime.
+     * @internal
+     */
+    async _handleAutoModeSwitchRequest(
+        request: AutoModeSwitchRequest
+    ): Promise<AutoModeSwitchResponse> {
+        if (!this.autoModeSwitchHandler) {
+            return "no";
+        }
+
+        return await this.autoModeSwitchHandler(request, { sessionId: this.sessionId });
+    }
+
+    /**
+     * Sets the host capabilities for this session.
+     *
+     * @param capabilities - The capabilities object from the create/resume response
+     * @internal This method is typically called internally when creating/resuming a session.
+     */
+    setCapabilities(capabilities?: SessionCapabilities): void {
+        this._capabilities = capabilities ?? {};
+    }
+
+    /**
+     * Snapshot of canvas instances currently known to be open for this session.
+     * Populated from the `session.resume` response and live `session.canvas.opened`
+     * and `session.canvas.closed` events. Returns a defensive copy — mutating the
+     * returned array has no effect on the session.
+     */
+    get openCanvases(): OpenCanvasInstance[] {
+        return [...this.openCanvasInstances];
+    }
+
+    /**
+     * Sets the open-canvas snapshot for this session.
+     *
+     * @param instances - The `openCanvases` array from the `session.resume` response.
+     * @internal This method is typically called internally when resuming a session.
+     */
+    setOpenCanvases(instances: OpenCanvasInstance[]): void {
+        this.openCanvasInstances = [...instances];
+    }
+
+    private assertElicitation(): void {
+        if (!this._capabilities.ui?.elicitation) {
+            throw new Error(
+                "Elicitation is not supported by the host. " +
+                    "Check session.capabilities.ui?.elicitation before calling UI methods."
+            );
+        }
+    }
+
+    private async _elicitation(params: ElicitationParams): Promise<ElicitationResult> {
+        this.assertElicitation();
+        return this.rpc.ui.elicitation({
+            message: params.message,
+            requestedSchema: params.requestedSchema,
+        });
+    }
+
+    private async _confirm(message: string): Promise<boolean> {
+        this.assertElicitation();
+        const result = await this.rpc.ui.elicitation({
+            message,
+            requestedSchema: {
+                type: "object",
+                properties: {
+                    confirmed: { type: "boolean", default: true },
+                },
+                required: ["confirmed"],
+            },
+        });
+        return result.action === "accept" && (result.content?.confirmed as boolean) === true;
+    }
+
+    private async _select(message: string, options: string[]): Promise<string | null> {
+        this.assertElicitation();
+        const result = await this.rpc.ui.elicitation({
+            message,
+            requestedSchema: {
+                type: "object",
+                properties: {
+                    selection: { type: "string", enum: options },
+                },
+                required: ["selection"],
+            },
+        });
+        if (result.action === "accept" && result.content?.selection != null) {
+            return result.content.selection as string;
+        }
+        return null;
+    }
+
+    private async _input(message: string, options?: UiInputOptions): Promise<string | null> {
+        this.assertElicitation();
+        const field: Record<string, unknown> = { type: "string" as const };
+        if (options?.title) field.title = options.title;
+        if (options?.description) field.description = options.description;
+        if (options?.minLength != null) field.minLength = options.minLength;
+        if (options?.maxLength != null) field.maxLength = options.maxLength;
+        if (options?.format) field.format = options.format;
+        if (options?.default != null) field.default = options.default;
+
+        const result = await this.rpc.ui.elicitation({
+            message,
+            requestedSchema: {
+                type: "object",
+                properties: {
+                    value: field as ElicitationParams["requestedSchema"]["properties"][string],
+                },
+                required: ["value"],
+            },
+        });
+        if (result.action === "accept" && result.content?.value != null) {
+            return result.content.value as string;
+        }
+        return null;
     }
 
     /**
@@ -366,27 +1768,45 @@ export class CopilotSession {
     }
 
     /**
-     * Handles a permission request from the Copilot CLI.
+     * Registers transform callbacks for system message sections.
      *
-     * @param request - The permission request data from the CLI
-     * @returns A promise that resolves with the permission decision
+     * @param callbacks - Map of section ID to transform callback, or undefined to clear
+     * @internal This method is typically called internally when creating a session.
+     */
+    registerTransformCallbacks(callbacks?: Map<string, SectionTransformFn>): void {
+        this.transformCallbacks = callbacks;
+    }
+
+    /**
+     * Handles a systemMessage.transform request from the runtime.
+     * Dispatches each section to its registered transform callback.
+     *
+     * @param sections - Map of section IDs to their current rendered content
+     * @returns A promise that resolves with the transformed sections
      * @internal This method is for internal use by the SDK.
      */
-    async _handlePermissionRequest(request: unknown): Promise<PermissionRequestResult> {
-        if (!this.permissionHandler) {
-            // No handler registered, deny permission
-            return { kind: "denied-no-approval-rule-and-could-not-request-from-user" };
+    async _handleSystemMessageTransform(
+        sections: Record<string, { content: string }>
+    ): Promise<{ sections: Record<string, { content: string }> }> {
+        const result: Record<string, { content: string }> = {};
+
+        for (const [sectionId, { content }] of Object.entries(sections)) {
+            const callback = this.transformCallbacks?.get(sectionId);
+            if (callback) {
+                try {
+                    const transformed = await callback(content);
+                    result[sectionId] = { content: transformed };
+                } catch (_error) {
+                    // Callback failed — return original content
+                    result[sectionId] = { content };
+                }
+            } else {
+                // No callback for this section — pass through unchanged
+                result[sectionId] = { content };
+            }
         }
 
-        try {
-            const result = await this.permissionHandler(request as PermissionRequest, {
-                sessionId: this.sessionId,
-            });
-            return result;
-        } catch (_error) {
-            // Handler failed, deny permission
-            return { kind: "denied-no-approval-rule-and-could-not-request-from-user" };
-        }
+        return { sections: result };
     }
 
     /**
@@ -426,7 +1846,14 @@ export class CopilotSession {
             return undefined;
         }
 
-        // Type-safe handler lookup with explicit casting
+        // All hook inputs share BaseHookInput, which exposes `timestamp` as a Date.
+        // The wire format sends it as Unix epoch ms (number), so we deserialize
+        // here, at the one place that knows the input is a hook payload. Bad data
+        // is left alone — the user-facing handler types still cast unknown to the
+        // specific HookInput, so a runtime type mismatch surfaces as a normal
+        // TypeError in user code rather than being silently masked.
+        const normalized = deserializeHookInput(input);
+
         type GenericHandler = (
             input: unknown,
             invocation: { sessionId: string }
@@ -434,11 +1861,14 @@ export class CopilotSession {
 
         const handlerMap: Record<string, GenericHandler | undefined> = {
             preToolUse: this.hooks.onPreToolUse as GenericHandler | undefined,
+            preMcpToolCall: this.hooks.onPreMcpToolCall as GenericHandler | undefined,
             postToolUse: this.hooks.onPostToolUse as GenericHandler | undefined,
+            postToolUseFailure: this.hooks.onPostToolUseFailure as GenericHandler | undefined,
             userPromptSubmitted: this.hooks.onUserPromptSubmitted as GenericHandler | undefined,
             sessionStart: this.hooks.onSessionStart as GenericHandler | undefined,
             sessionEnd: this.hooks.onSessionEnd as GenericHandler | undefined,
             errorOccurred: this.hooks.onErrorOccurred as GenericHandler | undefined,
+            agentStop: this.hooks.onAgentStop as GenericHandler | undefined,
         };
 
         const handler = handlerMap[hookType];
@@ -447,7 +1877,7 @@ export class CopilotSession {
         }
 
         try {
-            const result = await handler(input, { sessionId: this.sessionId });
+            const result = await handler(normalized, { sessionId: this.sessionId });
             return result;
         } catch (_error) {
             // Hook failed, return undefined
@@ -462,11 +1892,11 @@ export class CopilotSession {
      * assistant responses, tool executions, and other session events.
      *
      * @returns A promise that resolves with an array of all session events
-     * @throws Error if the session has been destroyed or the connection fails
+     * @throws Error if the session has been disconnected or the connection fails
      *
      * @example
      * ```typescript
-     * const events = await session.getMessages();
+     * const events = await session.getEvents();
      * for (const event of events) {
      *   if (event.type === "assistant.message") {
      *     console.log("Assistant:", event.data.content);
@@ -474,7 +1904,7 @@ export class CopilotSession {
      * }
      * ```
      */
-    async getMessages(): Promise<SessionEvent[]> {
+    async getEvents(): Promise<SessionEvent[]> {
         const response = await this.connection.sendRequest("session.getMessages", {
             sessionId: this.sessionId,
         });
@@ -483,29 +1913,39 @@ export class CopilotSession {
     }
 
     /**
-     * Destroys this session and releases all associated resources.
+     * Disconnects this session and releases all in-memory resources (event handlers,
+     * tool handlers, permission handlers).
      *
-     * After calling this method, the session can no longer be used. All event
-     * handlers and tool handlers are cleared. To continue the conversation,
-     * use {@link CopilotClient.resumeSession} with the session ID.
+     * Session state on disk (conversation history, planning state, artifacts) is
+     * preserved, so the conversation can be resumed later by calling
+     * {@link CopilotClient.resumeSession} with the session ID. To permanently
+     * remove all session data including files on disk, use
+     * {@link CopilotClient.deleteSession} instead.
      *
-     * @returns A promise that resolves when the session is destroyed
+     * After calling this method, the session object can no longer be used.
+     *
+     * @returns A promise that resolves when the session is disconnected
      * @throws Error if the connection fails
      *
      * @example
      * ```typescript
-     * // Clean up when done
-     * await session.destroy();
+     * // Clean up when done — session can still be resumed later
+     * await session.disconnect();
      * ```
      */
-    async destroy(): Promise<void> {
+    async disconnect(): Promise<void> {
+        if (this.disconnected) {
+            return;
+        }
         await this.connection.sendRequest("session.destroy", {
             sessionId: this.sessionId,
         });
-        this.eventHandlers.clear();
-        this.typedEventHandlers.clear();
-        this.toolHandlers.clear();
-        this.permissionHandler = undefined;
+        this._markDisconnected();
+    }
+
+    /** Enables `await using session = ...` syntax for automatic cleanup. */
+    async [Symbol.asyncDispose](): Promise<void> {
+        return this.disconnect();
     }
 
     /**
@@ -515,7 +1955,7 @@ export class CopilotSession {
      * and can continue to be used for new messages.
      *
      * @returns A promise that resolves when the abort request is acknowledged
-     * @throws Error if the session has been destroyed or the connection fails
+     * @throws Error if the session has been disconnected or the connection fails
      *
      * @example
      * ```typescript
@@ -533,4 +1973,289 @@ export class CopilotSession {
             sessionId: this.sessionId,
         });
     }
+
+    /**
+     * Change the model for this session.
+     * The new model takes effect for the next message. Conversation history is preserved.
+     *
+     * @param model - Model ID to switch to
+     * @param options - Optional settings for the new model
+     *
+     * @example
+     * ```typescript
+     * await session.setModel("gpt-5.4");
+     * await session.setModel("claude-sonnet-4.6", { reasoningEffort: "high" });
+     * ```
+     */
+    async setModel(
+        model: string,
+        options?: {
+            reasoningEffort?: ReasoningEffort;
+            reasoningSummary?: ReasoningSummary;
+            contextTier?: ContextTier;
+            modelCapabilities?: ModelCapabilitiesOverride;
+        }
+    ): Promise<void> {
+        await this.rpc.model.switchTo({ modelId: model, ...options });
+    }
+
+    /**
+     * Log a message to the session timeline.
+     * The message appears in the session event stream and is visible to SDK consumers
+     * and (for non-ephemeral messages) persisted to the session event log on disk.
+     *
+     * @param message - Human-readable message text
+     * @param options - Optional log level and ephemeral flag
+     *
+     * @example
+     * ```typescript
+     * await session.log("Processing started");
+     * await session.log("Disk usage high", { level: "warning" });
+     * await session.log("Connection failed", { level: "error" });
+     * await session.log("Debug info", { ephemeral: true });
+     * ```
+     */
+    async log(
+        message: string,
+        options?: { level?: "info" | "warning" | "error"; ephemeral?: boolean }
+    ): Promise<void> {
+        await this.rpc.log({ message, ...options });
+    }
+}
+
+/**
+ * Type guard that checks whether a value is a {@link ToolResultObject}.
+ * A valid object must have a string `textResultForLlm` and a recognized `resultType`.
+ */
+function isToolResultObject(value: unknown): value is ToolResultObject {
+    if (typeof value !== "object" || value === null) {
+        return false;
+    }
+
+    if (
+        !("textResultForLlm" in value) ||
+        typeof (value as ToolResultObject).textResultForLlm !== "string"
+    ) {
+        return false;
+    }
+
+    if (!("resultType" in value) || typeof (value as ToolResultObject).resultType !== "string") {
+        return false;
+    }
+
+    const allowedResultTypes: Array<ToolResultObject["resultType"]> = [
+        "success",
+        "failure",
+        "rejected",
+        "denied",
+        "timeout",
+    ];
+
+    return allowedResultTypes.includes((value as ToolResultObject).resultType);
+}
+
+/** Convert a canvas handler error into a ResponseError with a structured data envelope. */
+function toCanvasRpcError(error: unknown): ResponseError<unknown> {
+    if (error instanceof ResponseError) return error;
+    const code = error instanceof CanvasError ? error.code : "canvas_handler_error";
+    const message = error instanceof Error ? error.message : String(error);
+    return new ResponseError(ErrorCodes.InternalError, message, { code, message });
+}
+
+type FactoryResultValidationCategory =
+    | "unsupported_type"
+    | "non_finite_number"
+    | "negative_zero"
+    | "cyclic_value"
+    | "nested_undefined"
+    | "unsupported_object";
+
+interface StrictJsonValidationContext {
+    code: "factory_result_not_json" | "factory_step_not_json";
+    label: string;
+    allowTopLevelUndefined: boolean;
+}
+
+function strictJsonValidationError(
+    context: StrictJsonValidationContext,
+    category: FactoryResultValidationCategory,
+    message: string,
+    path: string
+): ResponseError<{ code: string; category: FactoryResultValidationCategory; path: string }> {
+    return new ResponseError(ErrorCodes.InternalError, message, {
+        code: context.code,
+        category,
+        path,
+    });
+}
+
+function assertStrictJson(
+    value: unknown,
+    context: StrictJsonValidationContext
+): asserts value is JsonValue | undefined {
+    const ancestors = new Set<object>();
+
+    const visit = (current: unknown, path: string, allowUndefined: boolean): void => {
+        if (current === undefined) {
+            if (allowUndefined) {
+                return;
+            }
+            throw strictJsonValidationError(
+                context,
+                "nested_undefined",
+                `${context.label} contains nested undefined at ${path}`,
+                path
+            );
+        }
+        if (current === null || typeof current === "boolean" || typeof current === "string") {
+            return;
+        }
+        if (typeof current === "number") {
+            if (!Number.isFinite(current)) {
+                throw strictJsonValidationError(
+                    context,
+                    "non_finite_number",
+                    `${context.label} contains a non-finite number at ${path}`,
+                    path
+                );
+            }
+            // JSON serializes -0 as "0", so a journaled -0 would come back as 0
+            // after a resume and break the lossless replay guarantee.
+            if (Object.is(current, -0)) {
+                throw strictJsonValidationError(
+                    context,
+                    "negative_zero",
+                    `${context.label} contains negative zero at ${path}; normalize it to 0`,
+                    path
+                );
+            }
+            return;
+        }
+        if (
+            typeof current === "function" ||
+            typeof current === "symbol" ||
+            typeof current === "bigint"
+        ) {
+            throw strictJsonValidationError(
+                context,
+                "unsupported_type",
+                `${context.label} contains a function, symbol, or BigInt at ${path}`,
+                path
+            );
+        }
+        if (typeof current !== "object") {
+            throw strictJsonValidationError(
+                context,
+                "unsupported_type",
+                `${context.label} contains a function, symbol, or BigInt at ${path}`,
+                path
+            );
+        }
+        if (ancestors.has(current)) {
+            throw strictJsonValidationError(
+                context,
+                "cyclic_value",
+                `${context.label} contains a cyclic reference at ${path}`,
+                path
+            );
+        }
+
+        ancestors.add(current);
+        try {
+            if (Array.isArray(current)) {
+                const keys = Reflect.ownKeys(current);
+                if (
+                    keys.length !== current.length + 1 ||
+                    keys.some(
+                        (key) =>
+                            key !== "length" &&
+                            (typeof key !== "string" ||
+                                !/^(0|[1-9]\d*)$/.test(key) ||
+                                Number(key) >= current.length)
+                    )
+                ) {
+                    throw strictJsonValidationError(
+                        context,
+                        "unsupported_object",
+                        `${context.label} contains a non-JSON array property at ${path}`,
+                        path
+                    );
+                }
+                for (let index = 0; index < current.length; index++) {
+                    const descriptor = Object.getOwnPropertyDescriptor(current, String(index));
+                    if (
+                        descriptor === undefined ||
+                        !descriptor.enumerable ||
+                        !("value" in descriptor)
+                    ) {
+                        throw strictJsonValidationError(
+                            context,
+                            "unsupported_object",
+                            `${context.label} contains a non-JSON array property at ${path}[${index}]`,
+                            `${path}[${index}]`
+                        );
+                    }
+                    visit(descriptor.value, `${path}[${index}]`, false);
+                }
+                return;
+            }
+
+            const prototype = Object.getPrototypeOf(current);
+            if (prototype !== Object.prototype && prototype !== null) {
+                throw strictJsonValidationError(
+                    context,
+                    "unsupported_object",
+                    `${context.label} contains a non-JSON object at ${path}`,
+                    path
+                );
+            }
+            for (const key of Reflect.ownKeys(current)) {
+                if (typeof key === "symbol") {
+                    throw strictJsonValidationError(
+                        context,
+                        "unsupported_type",
+                        `${context.label} contains a function, symbol, or BigInt at ${path}`,
+                        path
+                    );
+                }
+                const propertyPath = /^[A-Za-z_$][\w$]*$/.test(key)
+                    ? `${path}.${key}`
+                    : `${path}[${JSON.stringify(key)}]`;
+                const descriptor = Object.getOwnPropertyDescriptor(current, key);
+                if (
+                    descriptor === undefined ||
+                    !descriptor.enumerable ||
+                    !("value" in descriptor)
+                ) {
+                    throw strictJsonValidationError(
+                        context,
+                        "unsupported_object",
+                        `${context.label} contains a non-JSON property at ${propertyPath}`,
+                        propertyPath
+                    );
+                }
+                visit(descriptor.value, propertyPath, false);
+            }
+        } finally {
+            ancestors.delete(current);
+        }
+    };
+
+    visit(value, "$", context.allowTopLevelUndefined);
+}
+
+function assertFactoryResult(value: unknown): asserts value is JsonValue | undefined {
+    assertStrictJson(value, {
+        code: "factory_result_not_json",
+        label: "Factory result",
+        allowTopLevelUndefined: true,
+    });
+}
+
+function assertFactoryStepResult(value: unknown, key: string): asserts value is JsonValue {
+    assertStrictJson(value, {
+        code: "factory_step_not_json",
+        label: `Factory step "${key}" result`,
+        allowTopLevelUndefined: false,
+    });
 }
